@@ -1,6 +1,6 @@
 # mynet
 
-A new Flutter project.
+A new Flutter project. This is an optimization project of an already existing app for an Internet Service Provider.
 
 ## Getting Started
 
