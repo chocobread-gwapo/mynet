@@ -11,6 +11,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 
+import httpx
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -21,6 +22,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-only-secret-change-before-going-live")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "dev-webhook-secret")
 CURRENCY = "₱"
+
+# Leave PAYMONGO_SECRET_KEY unset to keep using the dev-mode payment simulator below.
+# Set it to your real sk_test_... key (Dashboard > Developers > API Keys) to take real test-mode payments.
+PAYMONGO_SECRET_KEY = os.getenv("PAYMONGO_SECRET_KEY", "")
+PAYMONGO_BASE = "https://api.paymongo.com/v2"
 
 engine = create_engine("sqlite:///./app.db", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
@@ -82,6 +88,7 @@ class Payment(Base):
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
     amount: Mapped[int]
     status: Mapped[str] = mapped_column(default="PENDING")  # PENDING | PAID
+    gateway_session_id: Mapped[str | None] = mapped_column(default=None)  # PayMongo checkout session id, if real
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
     paid_at: Mapped[datetime | None] = mapped_column(default=None)
 
@@ -95,10 +102,42 @@ class Notification(Base):
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
 
 
+class Issue(Base):
+    __tablename__ = "issues"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    category: Mapped[str]
+    message: Mapped[str]
+    status: Mapped[str] = mapped_column(default="OPEN")  # OPEN | RESOLVED
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
+
+
+class AddOn(Base):
+    __tablename__ = "addons"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str]
+    description: Mapped[str]
+    monthly_fee: Mapped[int]
+
+
+class AccountAddOn(Base):  # which add-ons are currently active on which account
+    __tablename__ = "account_addons"
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), primary_key=True)
+    addon_id: Mapped[int] = mapped_column(ForeignKey("addons.id"), primary_key=True)
+
+
 def seed() -> None:
     """Create tables and two fake demo accounts (no real customer data)."""
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
+        if not db.scalar(select(AddOn)):  # separate check: added after Plan seeding already existed for some installs
+            db.add_all([
+                AddOn(name="Static IP", description="A fixed public IP address for your connection", monthly_fee=19900),
+                AddOn(name="WiFi Mesh Extender", description="Extra access point to cover more of your home", monthly_fee=29900),
+                AddOn(name="Premium Support", description="Priority phone support, no hold queue", monthly_fee=14900),
+                AddOn(name="Extra Device Slot", description="Register one more device on your plan", monthly_fee=9900),
+            ])
+            db.commit()
         if db.scalar(select(Plan)):
             return
         starter, boost, turbo = (
@@ -151,7 +190,7 @@ def check_pw(pw: str, stored: str) -> bool:
 
 
 def make_token(user_id: int) -> str:
-    exp = datetime.now(timezone.utc) + timedelta(hours=12)
+    exp = datetime.now(timezone.utc) + timedelta(days=30)  # was 12 hours; mobile apps expect to stay signed in
     return jwt.encode({"sub": str(user_id), "exp": exp}, JWT_SECRET, algorithm="HS256")
 
 
@@ -281,15 +320,97 @@ class PayBody(BaseModel):
     amount: int  # minor units (centavos)
 
 
+async def _create_paymongo_session(payment_id: int, amount: int, description: str) -> tuple[str, str]:
+    """Creates a real PayMongo Hosted Checkout session. Returns (session_id, checkout_url)."""
+    body = {
+        "data": {
+            "attributes": {
+                "line_items": [{"currency": "PHP", "amount": amount, "name": description, "quantity": 1}],
+                "payment_method_types": ["card", "gcash", "qrph"],
+                # Not deep-linked back into the app yet — see the status-check endpoint below instead.
+                "success_url": "https://paymongo.com/",
+                "cancel_url": "https://paymongo.com/",
+                "reference_number": str(payment_id),
+                "description": description,
+            }
+        }
+    }
+    async with httpx.AsyncClient(timeout=15) as client:
+        res = await client.post(f"{PAYMONGO_BASE}/checkout_sessions", json=body, auth=(PAYMONGO_SECRET_KEY, ""))
+    res.raise_for_status()
+    data = res.json()["data"]
+    return data["id"], data["attributes"]["checkout_url"]
+
+
+def _payment_entry_status(entry: dict) -> str:
+    # Defensive: PayMongo's JSON:API responses usually nest fields under "attributes",
+    # but handle a flat shape too in case a particular endpoint doesn't.
+    return (entry.get("attributes") or {}).get("status") or entry.get("status") or ""
+
+
+async def _paymongo_session_paid(session_id: str) -> bool:
+    # Confirmed against PayMongo's own reference docs: retrieval lives on v1, unlike creation (v2).
+    url = f"https://api.paymongo.com/v1/checkout_sessions/{session_id}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        res = await client.get(url, auth=(PAYMONGO_SECRET_KEY, ""))
+    res.raise_for_status()
+    payments = res.json()["data"]["attributes"].get("payments") or []
+    return any(_payment_entry_status(p) == "paid" for p in payments)
+
+
+def _mark_paid(db: Session, payment: Payment) -> None:
+    """Shared by the webhook and the status-check endpoint. Idempotent: calling it twice changes nothing."""
+    if payment.status == "PAID":
+        return
+    payment.status, payment.paid_at = "PAID", datetime.now(timezone.utc)
+    acct = db.get(Account, payment.account_id)
+    acct.balance -= payment.amount
+    db.add(Notification(account_id=acct.id, title="Payment received",
+                        body=f"We received {CURRENCY}{payment.amount / 100:,.2f}. Thank you!"))
+    db.commit()
+
+
 @app.post("/api/v1/accounts/{account_id}/payments", status_code=201)
-def start_payment(body: PayBody, a: Account = Depends(my_account), db: Session = Depends(get_db)):
+async def start_payment(body: PayBody, a: Account = Depends(my_account), db: Session = Depends(get_db)):
     if body.amount <= 0:
         raise HTTPException(422, "Amount must be greater than zero")
     payment = Payment(account_id=a.id, amount=body.amount)
     db.add(payment)
     db.commit()
-    # TODO: create a checkout session with your payment gateway here and return its real URL.
-    return {"payment_id": payment.id, "status": payment.status, "checkout_url": f"https://gateway.example/pay/{payment.id}"}
+    db.refresh(payment)
+
+    if PAYMONGO_SECRET_KEY:
+        plan = db.get(Plan, a.plan_id)
+        try:
+            session_id, checkout_url = await _create_paymongo_session(payment.id, body.amount, f"{plan.name} plan bill")
+        except httpx.HTTPError as e:
+            raise HTTPException(502, f"Could not reach the payment provider: {e}")
+        payment.gateway_session_id = session_id
+        db.commit()
+        return {"payment_id": payment.id, "status": payment.status, "checkout_url": checkout_url, "real": True}
+
+    # Dev-mode fallback: no PAYMONGO_SECRET_KEY configured yet, so keep the old one-tap simulator working.
+    return {"payment_id": payment.id, "status": payment.status,
+            "checkout_url": f"https://gateway.example/pay/{payment.id}", "real": False}
+
+
+@app.post("/api/v1/accounts/{account_id}/payments/{payment_id}/check")
+async def check_payment(payment_id: int, a: Account = Depends(my_account), db: Session = Depends(get_db)):
+    """Called by the app after the user says they've finished paying in the browser."""
+    payment = db.get(Payment, payment_id)
+    if not payment or payment.account_id != a.id:
+        raise HTTPException(404, "Payment not found")
+    if payment.status == "PAID":
+        return {"paid": True, **account_view(a, db)}
+    if not payment.gateway_session_id:
+        raise HTTPException(409, "This payment isn't connected to a real payment session")
+    try:
+        paid = await _paymongo_session_paid(payment.gateway_session_id)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Could not reach the payment provider: {e}")
+    if paid:
+        _mark_paid(db, payment)
+    return {"paid": paid, **account_view(a, db)}
 
 
 class WebhookBody(BaseModel):
@@ -298,19 +419,15 @@ class WebhookBody(BaseModel):
 
 @app.post("/api/v1/webhooks/payments")
 def payment_webhook(body: WebhookBody, x_webhook_secret: str = Header(""), db: Session = Depends(get_db)):
-    """Called by the payment gateway, never by the app. Real gateways sign the body; verify that instead."""
+    """Called by the dev-mode simulator below, never by PayMongo. A real PayMongo webhook needs a public
+    URL and its own signature verification (HMAC-SHA256 over the Paymongo-Signature header) — a good next
+    step once this is deployed somewhere reachable from the internet, instead of the status-check endpoint."""
     if not hmac.compare_digest(x_webhook_secret.encode(), WEBHOOK_SECRET.encode()):
         raise HTTPException(401, "Bad webhook secret")
     payment = db.get(Payment, body.payment_id)
     if not payment:
         raise HTTPException(404, "Unknown payment")
-    if payment.status != "PAID":  # idempotent: a repeated webhook changes nothing
-        payment.status, payment.paid_at = "PAID", datetime.now(timezone.utc)
-        acct = db.get(Account, payment.account_id)
-        acct.balance -= payment.amount
-        db.add(Notification(account_id=acct.id, title="Payment received",
-                            body=f"We received {CURRENCY}{payment.amount / 100:,.2f}. Thank you!"))
-        db.commit()
+    _mark_paid(db, payment)
     return {"ok": True}
 
 
@@ -362,3 +479,78 @@ def notifications(a: Account = Depends(my_account), db: Session = Depends(get_db
     rows = db.scalars(select(Notification).where(Notification.account_id == a.id)
                       .order_by(Notification.created_at.desc()))
     return [{"id": n.id, "title": n.title, "body": n.body, "created_at": n.created_at.isoformat()} for n in rows]
+
+
+# ---------- issue reports ----------
+ISSUE_CATEGORIES = {"Connection", "Billing", "Account", "Other"}
+
+
+class IssueBody(BaseModel):
+    category: str
+    message: str
+
+
+@app.post("/api/v1/accounts/{account_id}/issues", status_code=201)
+def report_issue(body: IssueBody, a: Account = Depends(my_account), db: Session = Depends(get_db)):
+    if not body.message.strip():
+        raise HTTPException(422, "Please describe the issue")
+    category = body.category if body.category in ISSUE_CATEGORIES else "Other"
+    issue = Issue(account_id=a.id, category=category, message=body.message.strip())
+    db.add(issue)
+    db.commit()
+    return {"id": issue.id, "status": issue.status}
+
+
+@app.get("/api/v1/accounts/{account_id}/issues")
+def list_issues(a: Account = Depends(my_account), db: Session = Depends(get_db)):
+    rows = db.scalars(select(Issue).where(Issue.account_id == a.id).order_by(Issue.created_at.desc()))
+    return [{"id": i.id, "category": i.category, "message": i.message, "status": i.status,
+             "created_at": i.created_at.isoformat()} for i in rows]
+
+
+# ---------- add-ons ----------
+def addon_view(a: AddOn) -> dict:
+    return {"id": a.id, "name": a.name, "description": a.description, "monthly_fee": a.monthly_fee}
+
+
+@app.get("/api/v1/addons")
+def list_addons(db: Session = Depends(get_db)):
+    rows = db.scalars(select(AddOn).order_by(AddOn.monthly_fee))
+    return [addon_view(a) for a in rows]
+
+
+@app.get("/api/v1/accounts/{account_id}/addons")
+def account_addons(a: Account = Depends(my_account), db: Session = Depends(get_db)):
+    rows = db.scalars(
+        select(AddOn).join(AccountAddOn, AccountAddOn.addon_id == AddOn.id).where(AccountAddOn.account_id == a.id)
+    )
+    return [addon_view(x) for x in rows]
+
+
+class AddOnBody(BaseModel):
+    addon_id: int
+
+
+@app.post("/api/v1/accounts/{account_id}/addons", status_code=201)
+def subscribe_addon(body: AddOnBody, a: Account = Depends(my_account), db: Session = Depends(get_db)):
+    addon = db.get(AddOn, body.addon_id)
+    if not addon:
+        raise HTTPException(404, "Add-on not found")
+    if db.get(AccountAddOn, (a.id, addon.id)):
+        raise HTTPException(409, "Already subscribed to this add-on")
+    db.add(AccountAddOn(account_id=a.id, addon_id=addon.id))
+    a.balance += addon.monthly_fee  # simplified: added to the current bill rather than prorated to next cycle
+    db.commit()
+    return account_view(a, db)
+
+
+@app.delete("/api/v1/accounts/{account_id}/addons/{addon_id}")
+def unsubscribe_addon(addon_id: int, a: Account = Depends(my_account), db: Session = Depends(get_db)):
+    link = db.get(AccountAddOn, (a.id, addon_id))
+    if not link:
+        raise HTTPException(404, "Add-on not active on this account")
+    addon = db.get(AddOn, addon_id)
+    db.delete(link)
+    a.balance -= addon.monthly_fee
+    db.commit()
+    return account_view(a, db)

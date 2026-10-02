@@ -1,6 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'api.dart';
+import 'notifications.dart';
 
 const appName = 'MyNet'; // placeholder: choose your own name and logo
 const devSimulatePayments = true; // set to false once a real payment gateway is connected
@@ -18,7 +22,11 @@ final _bigButton = FilledButton.styleFrom(
   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
 );
 
-void main() => runApp(const App());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initNotifications();
+  runApp(const App());
+}
 
 // ---------- helpers ----------
 String peso(int centavos) {
@@ -35,7 +43,7 @@ String fmtDate(String iso) {
 }
 
 void signOut(BuildContext context) {
-  api.token = null;
+  api.clearToken(); // clears the in-memory token immediately; the storage delete finishes in the background
   Navigator.of(context).pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const LoginScreen()), (r) => false);
 }
 
@@ -126,13 +134,105 @@ Future<void> payNow(BuildContext context, Map<String, dynamic> acct, Future<void
   );
   if (ok != true) return;
   try {
-    final paymentId = await api.startPayment(acct['id'] as int, amount);
+    final started = await api.startPayment(acct['id'] as int, amount);
+    final paymentId = started['payment_id'] as int;
+
+    if (started['real'] == true) {
+      final opened = await launchUrl(Uri.parse(started['checkout_url'] as String), mode: LaunchMode.externalApplication);
+      if (!opened) throw ApiException("Couldn't open the payment page.");
+      if (context.mounted) {
+        await showDialog<void>(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => _WaitForPaymentDialog(accountId: acct['id'] as int, paymentId: paymentId, onChanged: done),
+        );
+      }
+      return;
+    }
+
+    // Dev-mode fallback: no real payment gateway configured on the server yet.
     if (devSimulatePayments) await api.devConfirm(paymentId);
     await done();
     messenger.showSnackBar(const SnackBar(content: Text('Payment received. Thank you!')));
   } catch (e) {
     messenger.showSnackBar(SnackBar(content: Text('$e')));
   }
+}
+
+/// Shown after the browser opens for a real payment. Checks automatically — right away whenever
+/// the app comes back to the foreground, and every few seconds as a backup — while still leaving
+/// the manual button in place for an instant, on-demand check.
+class _WaitForPaymentDialog extends StatefulWidget {
+  final int accountId;
+  final int paymentId;
+  final Future<void> Function() onChanged;
+  const _WaitForPaymentDialog({required this.accountId, required this.paymentId, required this.onChanged});
+
+  @override
+  State<_WaitForPaymentDialog> createState() => _WaitForPaymentDialogState();
+}
+
+class _WaitForPaymentDialogState extends State<_WaitForPaymentDialog> with WidgetsBindingObserver {
+  bool _checking = false; // only toggled for a manual tap, so background polls don't flicker the button
+  bool _inFlight = false; // guards against overlapping requests when the timer and a resume fire close together
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _timer = Timer.periodic(const Duration(seconds: 4), (_) => _check());
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) _check(); // most likely moment: they just switched back from paying
+  }
+
+  Future<void> _check({bool manual = false}) async {
+    if (_inFlight) return;
+    _inFlight = true;
+    if (manual) setState(() => _checking = true);
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final paid = await api.checkPayment(widget.accountId, widget.paymentId);
+      if (paid) {
+        await widget.onChanged();
+        if (mounted) Navigator.pop(context);
+        messenger.showSnackBar(const SnackBar(content: Text('Payment received. Thank you!')));
+        return;
+      }
+      if (manual) {
+        messenger.showSnackBar(const SnackBar(content: Text("We haven't received it yet — try again in a moment.")));
+      }
+    } catch (e) {
+      if (manual) messenger.showSnackBar(SnackBar(content: Text('$e'))); // background polls fail silently
+    } finally {
+      _inFlight = false;
+      if (manual && mounted) setState(() => _checking = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text('Waiting for payment'),
+        content: const Text(
+            "Finish paying in the browser that just opened — we'll pick it up automatically, or tap below to check right now."),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close')),
+          FilledButton(
+            onPressed: _checking ? null : () => _check(manual: true),
+            child: Text(_checking ? 'Checking...' : "I've Completed Payment"),
+          ),
+        ],
+      );
 }
 
 // ---------- app & login ----------
@@ -151,9 +251,45 @@ class App extends StatelessWidget {
         appBarTheme: const AppBarTheme(backgroundColor: _paper, foregroundColor: _ink, elevation: 0, scrolledUnderElevation: 0),
         inputDecorationTheme: InputDecorationTheme(border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
       ),
-      home: const LoginScreen(),
+      home: const AuthGate(),
     );
   }
+}
+
+/// Shown briefly at startup: tries a saved token before falling back to the login screen.
+class AuthGate extends StatefulWidget {
+  const AuthGate({super.key});
+  @override
+  State<AuthGate> createState() => _AuthGateState();
+}
+
+class _AuthGateState extends State<AuthGate> {
+  @override
+  void initState() {
+    super.initState();
+    _check();
+  }
+
+  Future<void> _check() async {
+    final saved = await api.loadSavedToken();
+    if (saved == null) return _goTo(const LoginScreen());
+    api.token = saved;
+    try {
+      await api.accounts(); // any successful call confirms the saved token still works
+      _goTo(const Shell());
+    } catch (_) {
+      await api.clearToken(); // expired or revoked: don't keep retrying with it
+      _goTo(const LoginScreen());
+    }
+  }
+
+  void _goTo(Widget page) {
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => page));
+  }
+
+  @override
+  Widget build(BuildContext context) => const Scaffold(body: Center(child: CircularProgressIndicator()));
 }
 
 class LoginScreen extends StatefulWidget {
@@ -320,6 +456,14 @@ class _ShellState extends State<Shell> {
       _accounts = [for (final e in list) Map<String, dynamic>.from(e as Map)];
       if (_sel >= _accounts.length) _sel = 0;
       _error = null;
+      for (final a in _accounts) {
+        await scheduleDueReminder(
+          accountId: a['id'] as int,
+          amountDue: a['amount_due'] as int,
+          dueDate: DateTime.parse(a['due_date'] as String),
+          planName: (a['plan'] as Map)['name'] as String,
+        );
+      }
     } catch (e) {
       if (_accounts.isEmpty) {
         _error = '$e';
@@ -574,6 +718,16 @@ class PlansPage extends StatelessWidget {
     final due = acct['amount_due'] as int;
     final currentId = (acct['plan'] as Map)['id'];
     return ListView(padding: const EdgeInsets.all(16), children: [
+      Panel(
+        child: ListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('Add-Ons', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+          subtitle: const Text('Extra services for your connection'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => Navigator.of(context)
+              .push(MaterialPageRoute(builder: (_) => AddOnsScreen(acct, onChanged))),
+        ),
+      ),
       if (due > 0) Panel(child: Text('Pay your ${peso(due)} amount due before changing plans.')),
       Loader<List<dynamic>>(
         load: api.plans,
@@ -597,6 +751,78 @@ class PlansPage extends StatelessWidget {
       ),
     ]);
   }
+}
+
+class AddOnsScreen extends StatefulWidget {
+  final Map<String, dynamic> acct;
+  final Future<void> Function() onChanged;
+  const AddOnsScreen(this.acct, this.onChanged, {super.key});
+  @override
+  State<AddOnsScreen> createState() => _AddOnsScreenState();
+}
+
+class _AddOnsData {
+  final List<dynamic> all;
+  final Set<int> activeIds;
+  _AddOnsData(this.all, this.activeIds);
+}
+
+class _AddOnsScreenState extends State<AddOnsScreen> {
+  int _version = 0;
+
+  Future<_AddOnsData> _load() async {
+    final id = widget.acct['id'] as int;
+    final all = await api.addons();
+    final active = await api.accountAddons(id);
+    return _AddOnsData(all, {for (final a in active) a['id'] as int});
+  }
+
+  Future<void> _toggle(Map addon, bool isActive) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final id = widget.acct['id'] as int;
+    try {
+      if (isActive) {
+        await api.unsubscribeAddon(id, addon['id'] as int);
+      } else {
+        await api.subscribeAddon(id, addon['id'] as int);
+      }
+      await widget.onChanged(); // refreshes the account balance shown on Home/Bills
+      if (mounted) setState(() => _version++); // refetches this screen's own list
+      messenger.showSnackBar(
+          SnackBar(content: Text(isActive ? 'Removed ${addon['name']}.' : 'Added ${addon['name']}.')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('Add-Ons')),
+        body: Loader<_AddOnsData>(
+          key: ValueKey(_version),
+          load: _load,
+          builder: (c, data) => ListView(padding: const EdgeInsets.all(16), children: [
+            const Text('Add-ons appear on your current bill right away, and stay on until you remove them.'),
+            const SizedBox(height: 12),
+            for (final addon in data.all)
+              Panel(
+                child: Row(children: [
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('${addon['name']}', style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+                      Text('${addon['description']}'),
+                      Text('${peso(addon['monthly_fee'] as int)}/month'),
+                    ]),
+                  ),
+                  OutlinedButton(
+                    onPressed: () => _toggle(addon as Map, data.activeIds.contains(addon['id'])),
+                    child: Text(data.activeIds.contains(addon['id']) ? 'Remove' : 'Add'),
+                  ),
+                ]),
+              ),
+          ]),
+        ),
+      );
 }
 
 class AccountPage extends StatelessWidget {
@@ -639,7 +865,70 @@ class AccountPage extends StatelessWidget {
           kv('Status', acct['status'] == 'ACTIVE' ? 'Active' : 'Suspended'),
         ]),
       ),
+      OutlinedButton(
+        onPressed: () => Navigator.of(context)
+            .push(MaterialPageRoute(builder: (_) => ReportIssueScreen(accountId: acct['id'] as int))),
+        child: const Text('Report an issue'),
+      ),
+      const SizedBox(height: 8),
       OutlinedButton(onPressed: () => _unlink(context), child: const Text('Unlink this account')),
     ]);
   }
+}
+
+class ReportIssueScreen extends StatefulWidget {
+  final int accountId;
+  const ReportIssueScreen({super.key, required this.accountId});
+  @override
+  State<ReportIssueScreen> createState() => _ReportIssueScreenState();
+}
+
+class _ReportIssueScreenState extends State<ReportIssueScreen> {
+  static const _categories = ['Connection', 'Billing', 'Account', 'Other'];
+  String _category = _categories.first;
+  final _message = TextEditingController();
+  bool _busy = false;
+
+  Future<void> _submit() async {
+    final messenger = ScaffoldMessenger.of(context);
+    if (_message.text.trim().isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text('Please describe the issue first.')));
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      await api.reportIssue(widget.accountId, _category, _message.text.trim());
+      if (mounted) Navigator.of(context).pop();
+      messenger.showSnackBar(const SnackBar(content: Text('Thanks — your report was submitted.')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('Report an Issue')),
+        body: ListView(padding: const EdgeInsets.all(16), children: [
+          DropdownButtonFormField<String>(
+            initialValue: _category,
+            decoration: const InputDecoration(labelText: 'Category'),
+            items: [for (final c in _categories) DropdownMenuItem(value: c, child: Text(c))],
+            onChanged: (v) => setState(() => _category = v ?? _category),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _message,
+            maxLines: 5,
+            decoration: const InputDecoration(labelText: 'What happened?', alignLabelWithHint: true),
+          ),
+          const SizedBox(height: 20),
+          FilledButton(
+            style: _bigButton,
+            onPressed: _busy ? null : _submit,
+            child: Text(_busy ? 'Sending...' : 'Submit'),
+          ),
+        ]),
+      );
 }

@@ -1,10 +1,14 @@
 import 'dart:convert';
 
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
 /// The Android emulator reaches your PC's localhost at 10.0.2.2.
 /// On a real phone, use your PC's address on the same Wi-Fi, e.g. http://192.168.1.20:8000/api/v1
 const String baseUrl = 'http://10.0.2.2:8000/api/v1';
+
+const _tokenKey = 'auth_token';
+const _storage = FlutterSecureStorage();
 
 class ApiException implements Exception {
   final String message;
@@ -15,6 +19,26 @@ class ApiException implements Exception {
 
 class Api {
   String? token;
+
+  /// Reads a token saved from a previous session, if any. Called once at app startup.
+  Future<String?> loadSavedToken() async {
+    try {
+      return await _storage.read(key: _tokenKey);
+    } catch (_) {
+      return null; // corrupted or inaccessible storage: just treat it as logged out
+    }
+  }
+
+  Future<void> _saveToken(String value) async {
+    token = value;
+    await _storage.write(key: _tokenKey, value: value);
+  }
+
+  /// Clears both the in-memory token and the saved copy. Safe to call without awaiting.
+  Future<void> clearToken() async {
+    token = null;
+    await _storage.delete(key: _tokenKey);
+  }
 
   Future<dynamic> _send(String method, String path, {Object? body}) async {
     final req = http.Request(method, Uri.parse('$baseUrl$path'));
@@ -45,7 +69,7 @@ class Api {
   Future<void> login(String email, String password, {bool register = false}) async {
     final d = await _send('POST', register ? '/auth/register' : '/auth/login',
         body: {'email': email, 'password': password});
-    token = d['token'] as String;
+    await _saveToken(d['token'] as String);
   }
 
   Future<List<dynamic>> accounts() async => (await _send('GET', '/accounts')) as List<dynamic>;
@@ -69,15 +93,43 @@ class Api {
   Future<List<dynamic>> notifications(int id) async =>
       (await _send('GET', '/accounts/$id/notifications')) as List<dynamic>;
 
+  Future<void> reportIssue(int accountId, String category, String message) async {
+    await _send('POST', '/accounts/$accountId/issues', body: {'category': category, 'message': message});
+  }
+
+  Future<List<dynamic>> issues(int accountId) async =>
+      (await _send('GET', '/accounts/$accountId/issues')) as List<dynamic>;
+
+  Future<List<dynamic>> addons() async => (await _send('GET', '/addons')) as List<dynamic>;
+
+  Future<List<dynamic>> accountAddons(int accountId) async =>
+      (await _send('GET', '/accounts/$accountId/addons')) as List<dynamic>;
+
+  Future<void> subscribeAddon(int accountId, int addonId) async {
+    await _send('POST', '/accounts/$accountId/addons', body: {'addon_id': addonId});
+  }
+
+  Future<void> unsubscribeAddon(int accountId, int addonId) async {
+    await _send('DELETE', '/accounts/$accountId/addons/$addonId');
+  }
+
   Future<List<dynamic>> plans() async => (await _send('GET', '/plans')) as List<dynamic>;
 
   Future<void> upgrade(int id, int planId) async {
     await _send('POST', '/accounts/$id/upgrade', body: {'plan_id': planId});
   }
 
-  Future<int> startPayment(int id, int amount) async {
+  /// Returns payment_id, checkout_url, and real (true once a PayMongo key is configured server-side).
+  Future<Map<String, dynamic>> startPayment(int id, int amount) async {
     final d = await _send('POST', '/accounts/$id/payments', body: {'amount': amount});
-    return d['payment_id'] as int;
+    return Map<String, dynamic>.from(d as Map);
+  }
+
+  /// Asks the server to check a real payment's status with PayMongo. Call this after the
+  /// user says they've finished paying in the browser.
+  Future<bool> checkPayment(int accountId, int paymentId) async {
+    final d = await _send('POST', '/accounts/$accountId/payments/$paymentId/check');
+    return d['paid'] as bool;
   }
 
   /// Development only: asks the dev API to act as the payment gateway.
