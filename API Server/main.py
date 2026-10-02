@@ -348,14 +348,21 @@ def _payment_entry_status(entry: dict) -> str:
     return (entry.get("attributes") or {}).get("status") or entry.get("status") or ""
 
 
-async def _paymongo_session_paid(session_id: str) -> bool:
+async def _paymongo_session_status(session_id: str) -> str:
+    """Returns 'paid', 'failed', or 'pending'. PayMongo's own Payment Resource docs confirm these
+    are the only three statuses a Payment can have, so this covers every case."""
     # Confirmed against PayMongo's own reference docs: retrieval lives on v1, unlike creation (v2).
     url = f"https://api.paymongo.com/v1/checkout_sessions/{session_id}"
     async with httpx.AsyncClient(timeout=15) as client:
         res = await client.get(url, auth=(PAYMONGO_SECRET_KEY, ""))
     res.raise_for_status()
     payments = res.json()["data"]["attributes"].get("payments") or []
-    return any(_payment_entry_status(p) == "paid" for p in payments)
+    statuses = {_payment_entry_status(p) for p in payments}
+    if "paid" in statuses:
+        return "paid"
+    if statuses and statuses == {"failed"}:  # every attempt so far failed, and nothing is still pending
+        return "failed"
+    return "pending"
 
 
 def _mark_paid(db: Session, payment: Payment) -> None:
@@ -401,16 +408,17 @@ async def check_payment(payment_id: int, a: Account = Depends(my_account), db: S
     if not payment or payment.account_id != a.id:
         raise HTTPException(404, "Payment not found")
     if payment.status == "PAID":
-        return {"paid": True, **account_view(a, db)}
+        return {"payment_status": "paid", **account_view(a, db)}
     if not payment.gateway_session_id:
         raise HTTPException(409, "This payment isn't connected to a real payment session")
     try:
-        paid = await _paymongo_session_paid(payment.gateway_session_id)
+        gateway_status = await _paymongo_session_status(payment.gateway_session_id)
     except httpx.HTTPError as e:
         raise HTTPException(502, f"Could not reach the payment provider: {e}")
-    if paid:
+    if gateway_status == "paid":
         _mark_paid(db, payment)
-    return {"paid": paid, **account_view(a, db)}
+    # Named payment_status, not status, since account_view already has its own "status" (ACTIVE/SUSPENDED).
+    return {"payment_status": gateway_status, **account_view(a, db)}
 
 
 class WebhookBody(BaseModel):

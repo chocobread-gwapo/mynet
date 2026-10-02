@@ -125,11 +125,11 @@ class Api {
     return Map<String, dynamic>.from(d as Map);
   }
 
-  /// Asks the server to check a real payment's status with PayMongo. Call this after the
-  /// user says they've finished paying in the browser.
-  Future<bool> checkPayment(int accountId, int paymentId) async {
+  /// Asks the server to check a real payment's status with PayMongo.
+  /// Returns 'paid', 'failed', or 'pending'.
+  Future<String> checkPayment(int accountId, int paymentId) async {
     final d = await _send('POST', '/accounts/$accountId/payments/$paymentId/check');
-    return d['paid'] as bool;
+    return d['payment_status'] as String;
   }
 
   /// Development only: asks the dev API to act as the payment gateway.

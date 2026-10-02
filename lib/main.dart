@@ -202,11 +202,17 @@ class _WaitForPaymentDialogState extends State<_WaitForPaymentDialog> with Widge
     if (manual) setState(() => _checking = true);
     final messenger = ScaffoldMessenger.of(context);
     try {
-      final paid = await api.checkPayment(widget.accountId, widget.paymentId);
-      if (paid) {
+      final status = await api.checkPayment(widget.accountId, widget.paymentId);
+      if (status == 'paid') {
         await widget.onChanged();
         if (mounted) Navigator.pop(context);
         messenger.showSnackBar(const SnackBar(content: Text('Payment received. Thank you!')));
+        return;
+      }
+      if (status == 'failed') {
+        if (mounted) Navigator.pop(context);
+        messenger.showSnackBar(
+            const SnackBar(content: Text("That payment didn't go through. Tap Pay again to try another method.")));
         return;
       }
       if (manual) {
