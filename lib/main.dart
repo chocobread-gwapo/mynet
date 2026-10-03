@@ -6,7 +6,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'api.dart';
 import 'notifications.dart';
 
-const appName = 'MyNet'; // placeholder: choose your own name and logo
+const appName = 'NetPulse';
 const devSimulatePayments = true; // set to false once a real payment gateway is connected
 
 final api = Api();

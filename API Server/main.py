@@ -8,8 +8,12 @@ Balance > 0 means the customer owes money; balance < 0 means they have credit.
 import hashlib
 import hmac
 import os
+import secrets
+import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 import jwt
@@ -19,8 +23,23 @@ from pydantic import BaseModel
 from sqlalchemy import ForeignKey, String, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-only-secret-change-before-going-live")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "dev-webhook-secret")
+def _get_or_create_secret(env_name: str, filename: str) -> str:
+    """Uses an env var if one is set. Otherwise generates a random secret the first time this runs
+    and reuses it from a local file after that, so a server restart doesn't log everyone out. Never
+    hardcode a real secret in source — anyone reading the code (or a public repo) could forge tokens."""
+    value = os.getenv(env_name)
+    if value:
+        return value
+    path = Path(filename)
+    if path.exists():
+        return path.read_text().strip()
+    value = secrets.token_hex(32)
+    path.write_text(value)
+    return value
+
+
+JWT_SECRET = _get_or_create_secret("JWT_SECRET", ".jwt_secret")
+WEBHOOK_SECRET = _get_or_create_secret("WEBHOOK_SECRET", ".webhook_secret")
 CURRENCY = "₱"
 
 # Leave PAYMONGO_SECRET_KEY unset to keep using the dev-mode payment simulator below.
@@ -124,6 +143,21 @@ class AccountAddOn(Base):  # which add-ons are currently active on which account
     __tablename__ = "account_addons"
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), primary_key=True)
     addon_id: Mapped[int] = mapped_column(ForeignKey("addons.id"), primary_key=True)
+
+
+_rate_limit_attempts: dict[str, list[float]] = defaultdict(list)
+
+
+def rate_limit(key: str, max_attempts: int = 5, window_seconds: int = 60) -> None:
+    """Simple in-memory rate limit, e.g. 5 tries per key per minute. Resets on server restart and
+    is per-process, not shared across multiple server instances — fine for a personal project, but
+    swap in something like Redis-backed rate limiting before running this at real scale."""
+    now = time.time()
+    attempts = [t for t in _rate_limit_attempts[key] if now - t < window_seconds]
+    if len(attempts) >= max_attempts:
+        raise HTTPException(429, "Too many attempts. Please wait a bit and try again.")
+    attempts.append(now)
+    _rate_limit_attempts[key] = attempts
 
 
 def seed() -> None:
@@ -260,7 +294,9 @@ def register(body: Credentials, db: Session = Depends(get_db)):
 
 @app.post("/api/v1/auth/login")
 def login(body: Credentials, db: Session = Depends(get_db)):
-    user = db.scalar(select(User).where(User.email == body.email.strip().lower()))
+    email = body.email.strip().lower()
+    rate_limit(f"login:{email}")
+    user = db.scalar(select(User).where(User.email == email))
     if not user or not check_pw(body.password, user.password_hash):
         raise HTTPException(401, "Wrong email or password")
     return {"token": make_token(user.id)}
@@ -274,6 +310,7 @@ class LinkBody(BaseModel):
 
 @app.post("/api/v1/accounts/link", status_code=201)
 def link_account(body: LinkBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rate_limit(f"link:{body.account_no}")
     acct = db.scalar(select(Account).where(Account.account_no == body.account_no))
     if not acct or acct.mobile != body.mobile:
         raise HTTPException(404, "No matching account")
@@ -439,7 +476,8 @@ def payment_webhook(body: WebhookBody, x_webhook_secret: str = Header(""), db: S
     return {"ok": True}
 
 
-DEV_MODE = os.getenv("DEV_MODE", "1") == "1"  # set DEV_MODE=0 before going live
+DEV_MODE = os.getenv("DEV_MODE", "0") == "1"  # off by default now; set DEV_MODE=1 locally if you want the
+# one-tap payment shortcut back (e.g. to test without touching PayMongo) — never set it on a real deployment
 
 if DEV_MODE:
 

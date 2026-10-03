@@ -1,0 +1,14 @@
+# Generated secrets — each machine gets its own; never commit these
+.jwt_secret
+.webhook_secret
+
+# Local database — contains whatever test accounts/users you've created
+app.db
+
+# Python environment and caches
+.venv/
+__pycache__/
+*.pyc
+
+# Local env file, if you ever create one instead of setting vars in the shell
+.env
