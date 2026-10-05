@@ -12,3 +12,6 @@ __pycache__/
 
 # Local env file, if you ever create one instead of setting vars in the shell
 .env
+
+# Your real secrets — config.example.json (no real values) is fine to keep/commit
+config.json

@@ -11,9 +11,8 @@ const devSimulatePayments = true; // set to false once a real payment gateway is
 
 final api = Api();
 
-const _ink = Color(0xFF101828);
-const _line = Color(0xFFE3E6E0);
-const _paper = Color(0xFFF6F7F5);
+// Status green and warning amber read fine on both light and dark surfaces, so these two stay
+// as fixed accent colors. Anything that needed to flip between light/dark now reads from Theme.of(context) instead.
 const _good = Color(0xFF15803D);
 const _warn = Color(0xFFB45309);
 
@@ -72,17 +71,20 @@ class Panel extends StatelessWidget {
   final Widget child;
   const Panel({super.key, required this.child});
   @override
-  Widget build(BuildContext context) => Container(
-        width: double.infinity,
-        padding: const EdgeInsets.all(16),
-        margin: const EdgeInsets.only(bottom: 12),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: _line),
-        ),
-        child: child,
-      );
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: scheme.outlineVariant),
+      ),
+      child: child,
+    );
+  }
 }
 
 /// Loads data, shows a spinner, and shows a clear message with a retry button if it fails.
@@ -242,24 +244,35 @@ class _WaitForPaymentDialogState extends State<_WaitForPaymentDialog> with Widge
 }
 
 // ---------- app & login ----------
+const _seedColor = Color(0xFF0F766E);
+
+ThemeData _buildTheme(Brightness brightness) {
+  final scheme = ColorScheme.fromSeed(seedColor: _seedColor, brightness: brightness);
+  return ThemeData(
+    useMaterial3: true,
+    colorScheme: scheme,
+    scaffoldBackgroundColor: scheme.surface,
+    appBarTheme: AppBarTheme(
+      backgroundColor: scheme.surface,
+      foregroundColor: scheme.onSurface,
+      elevation: 0,
+      scrolledUnderElevation: 0,
+    ),
+    inputDecorationTheme: InputDecorationTheme(border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
+  );
+}
+
 class App extends StatelessWidget {
   const App({super.key});
   @override
-  Widget build(BuildContext context) {
-    final scheme = ColorScheme.fromSeed(seedColor: const Color(0xFF0F766E)).copyWith(surface: _paper, onSurface: _ink);
-    return MaterialApp(
-      title: appName,
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        colorScheme: scheme,
-        scaffoldBackgroundColor: _paper,
-        appBarTheme: const AppBarTheme(backgroundColor: _paper, foregroundColor: _ink, elevation: 0, scrolledUnderElevation: 0),
-        inputDecorationTheme: InputDecorationTheme(border: OutlineInputBorder(borderRadius: BorderRadius.circular(12))),
-      ),
-      home: const AuthGate(),
-    );
-  }
+  Widget build(BuildContext context) => MaterialApp(
+        title: appName,
+        debugShowCheckedModeBanner: false,
+        themeMode: ThemeMode.system,
+        theme: _buildTheme(Brightness.light),
+        darkTheme: _buildTheme(Brightness.dark),
+        home: const AuthGate(),
+      );
 }
 
 /// Shown briefly at startup: tries a saved token before falling back to the login screen.
@@ -305,12 +318,14 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
+  final _formKey = GlobalKey<FormState>();
   final _email = TextEditingController();
   final _password = TextEditingController();
   bool _register = false, _busy = false, _hide = true;
   String? _error;
 
   Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
     setState(() {
       _busy = true;
       _error = null;
@@ -334,46 +349,62 @@ class _LoginScreenState extends State<LoginScreen> {
               padding: const EdgeInsets.all(24),
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 420),
-                child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-                  const Text(appName, style: TextStyle(fontSize: 36, fontWeight: FontWeight.w800)),
-                  const SizedBox(height: 8),
-                  const Text('See what you owe and pay your internet bill in one tap.'),
-                  const SizedBox(height: 32),
-                  TextField(
-                    controller: _email,
-                    keyboardType: TextInputType.emailAddress,
-                    decoration: const InputDecoration(labelText: 'Email'),
-                  ),
-                  const SizedBox(height: 12),
-                  TextField(
-                    controller: _password,
-                    obscureText: _hide,
-                    decoration: InputDecoration(
-                      labelText: 'Password',
-                      helperText: _register ? 'At least 8 characters' : null,
-                      suffixIcon: IconButton(
-                        tooltip: _hide ? 'Show password' : 'Hide password',
-                        icon: Icon(_hide ? Icons.visibility_outlined : Icons.visibility_off_outlined),
-                        onPressed: () => setState(() => _hide = !_hide),
+                child: Form(
+                  key: _formKey,
+                  autovalidateMode: AutovalidateMode.onUserInteraction,
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                    const Text(appName, style: TextStyle(fontSize: 36, fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 8),
+                    const Text('See what you owe and pay your internet bill in one tap.'),
+                    const SizedBox(height: 32),
+                    TextFormField(
+                      controller: _email,
+                      keyboardType: TextInputType.emailAddress,
+                      decoration: const InputDecoration(labelText: 'Email'),
+                      validator: (v) {
+                        final value = v?.trim() ?? '';
+                        if (value.isEmpty) return 'Enter your email';
+                        if (!value.contains('@') || !value.contains('.')) return 'Enter a valid email';
+                        return null;
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: _password,
+                      obscureText: _hide,
+                      decoration: InputDecoration(
+                        labelText: 'Password',
+                        helperText: _register ? 'At least 8 characters' : null,
+                        suffixIcon: IconButton(
+                          tooltip: _hide ? 'Show password' : 'Hide password',
+                          icon: Icon(_hide ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+                          onPressed: () => setState(() => _hide = !_hide),
+                        ),
                       ),
+                      validator: (v) {
+                        final value = v ?? '';
+                        if (value.isEmpty) return 'Enter your password';
+                        if (value.length < 8) return 'At least 8 characters';
+                        return null;
+                      },
                     ),
-                  ),
-                  if (_error != null)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 12),
-                      child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318))),
+                    if (_error != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318))),
+                      ),
+                    const SizedBox(height: 20),
+                    FilledButton(
+                      style: _bigButton,
+                      onPressed: _busy ? null : _submit,
+                      child: Text(_busy ? 'Please wait...' : (_register ? 'Create account' : 'Sign in')),
                     ),
-                  const SizedBox(height: 20),
-                  FilledButton(
-                    style: _bigButton,
-                    onPressed: _busy ? null : _submit,
-                    child: Text(_busy ? 'Please wait...' : (_register ? 'Create account' : 'Sign in')),
-                  ),
-                  TextButton(
-                    onPressed: () => setState(() => _register = !_register),
-                    child: Text(_register ? 'I already have an account' : 'Create an account'),
-                  ),
-                ]),
+                    TextButton(
+                      onPressed: () => setState(() => _register = !_register),
+                      child: Text(_register ? 'I already have an account' : 'Create an account'),
+                    ),
+                  ]),
+                ),
               ),
             ),
           ),
@@ -390,12 +421,14 @@ class LinkAccountScreen extends StatefulWidget {
 }
 
 class _LinkAccountScreenState extends State<LinkAccountScreen> {
+  final _formKey = GlobalKey<FormState>();
   final _no = TextEditingController();
   final _mobile = TextEditingController();
   bool _busy = false;
   String? _error;
 
   Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
     setState(() {
       _busy = true;
       _error = null;
@@ -417,23 +450,32 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
           title: const Text('Link your account'),
           actions: [IconButton(tooltip: 'Sign out', icon: const Icon(Icons.logout), onPressed: () => signOut(context))],
         ),
-        body: ListView(padding: const EdgeInsets.all(24), children: [
-          const Text('Enter the account number on your bill and the mobile number registered to it.'),
-          const SizedBox(height: 20),
-          TextField(controller: _no, decoration: const InputDecoration(labelText: 'Account number')),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _mobile,
-            keyboardType: TextInputType.phone,
-            decoration: const InputDecoration(labelText: 'Registered mobile number'),
-          ),
-          if (_error != null)
-            Padding(padding: const EdgeInsets.only(top: 12), child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318)))),
-          const SizedBox(height: 20),
-          FilledButton(style: _bigButton, onPressed: _busy ? null : _submit, child: Text(_busy ? 'Linking...' : 'Link account')),
-          const SizedBox(height: 16),
-          const Text('Demo data: DEMO-000001 with 5550100001, or DEMO-000002 with 5550100002.'),
-        ]),
+        body: Form(
+          key: _formKey,
+          autovalidateMode: AutovalidateMode.onUserInteraction,
+          child: ListView(padding: const EdgeInsets.all(24), children: [
+            const Text('Enter the account number on your bill and the mobile number registered to it.'),
+            const SizedBox(height: 20),
+            TextFormField(
+              controller: _no,
+              decoration: const InputDecoration(labelText: 'Account number'),
+              validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter your account number' : null,
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _mobile,
+              keyboardType: TextInputType.phone,
+              decoration: const InputDecoration(labelText: 'Registered mobile number'),
+              validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the registered mobile number' : null,
+            ),
+            if (_error != null)
+              Padding(padding: const EdgeInsets.only(top: 12), child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318)))),
+            const SizedBox(height: 20),
+            FilledButton(style: _bigButton, onPressed: _busy ? null : _submit, child: Text(_busy ? 'Linking...' : 'Link account')),
+            const SizedBox(height: 16),
+            const Text('Demo data: DEMO-000001 with 5550100001, or DEMO-000002 with 5550100002.'),
+          ]),
+        ),
       );
 }
 
@@ -593,7 +635,11 @@ class HomePage extends StatelessWidget {
             const SizedBox(height: 4),
             Text(
               peso(due > 0 ? due : credit),
-              style: TextStyle(fontSize: 40, fontWeight: FontWeight.w800, color: due > 0 ? _warn : _ink),
+              style: TextStyle(
+                fontSize: 40,
+                fontWeight: FontWeight.w800,
+                color: due > 0 ? _warn : Theme.of(context).colorScheme.onSurface,
+              ),
             ),
             if (due > 0) Text('Due ${fmtDate('${acct['due_date']}')}'),
             const SizedBox(height: 16),

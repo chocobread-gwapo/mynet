@@ -1,12 +1,14 @@
 """Starter billing API for an internet-subscription app (FastAPI + SQLite).
 
-Run:  uvicorn main:app --reload      Docs / playground:  http://127.0.0.1:8000/docs
+Run:  uvicorn main:app --reload      (or just press Run/F5 on this file in VS Code)
+Docs / playground:  http://127.0.0.1:8000/docs
 
 Money is stored as whole minor units (centavos), so there are no floating-point errors.
 Balance > 0 means the customer owes money; balance < 0 means they have credit.
 """
 import hashlib
 import hmac
+import json
 import os
 import secrets
 import time
@@ -17,11 +19,41 @@ from pathlib import Path
 
 import httpx
 import jwt
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy import ForeignKey, String, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
+# Anchored to this file's own folder, not the current working directory — otherwise running via
+# `uvicorn` after cd-ing into this folder vs. via VS Code's Run/F5 button can silently resolve
+# .env, config.json, and the database to two different places depending on how the process starts.
+_BASE_DIR = Path(__file__).resolve().parent
+
+load_dotenv(_BASE_DIR / ".env")  # reads .env into the environment, if the file exists
+
+
+def _load_config() -> dict:
+    """Reads config.json next to this script, if it exists. Lets you keep values like your
+    PayMongo key persisted locally instead of retyping $env:... every time you open a new terminal."""
+    path = _BASE_DIR / "config.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+_config = _load_config()
+
+
+def config_value(name: str, default: str = "") -> str:
+    """Checks the environment first (so a one-off $env:... override still wins), then config.json,
+    then falls back to default."""
+    return os.getenv(name) or _config.get(name, default)
+
 
 def _get_or_create_secret(env_name: str, filename: str) -> str:
     """Uses an env var if one is set. Otherwise generates a random secret the first time this runs
@@ -44,10 +76,10 @@ CURRENCY = "₱"
 
 # Leave PAYMONGO_SECRET_KEY unset to keep using the dev-mode payment simulator below.
 # Set it to your real sk_test_... key (Dashboard > Developers > API Keys) to take real test-mode payments.
-PAYMONGO_SECRET_KEY = os.getenv("PAYMONGO_SECRET_KEY", "")
+PAYMONGO_SECRET_KEY = config_value("PAYMONGO_SECRET_KEY")
 PAYMONGO_BASE = "https://api.paymongo.com/v2"
 
-engine = create_engine("sqlite:///./app.db", connect_args={"check_same_thread": False})
+engine = create_engine(f"sqlite:///{(_BASE_DIR / 'app.db').as_posix()}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 
 
@@ -600,3 +632,12 @@ def unsubscribe_addon(addon_id: int, a: Account = Depends(my_account), db: Sessi
     a.balance -= addon.monthly_fee
     db.commit()
     return account_view(a, db)
+
+
+if __name__ == "__main__":
+    # Lets VS Code's Run/F5 button start the server directly — equivalent to running
+    # `uvicorn main:app --reload` by hand. Only runs when this file is executed directly,
+    # never when something else imports it (e.g. the test suite), so nothing else changes.
+    import uvicorn
+
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
