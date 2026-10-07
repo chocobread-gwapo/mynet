@@ -20,6 +20,10 @@ class ApiException implements Exception {
 class Api {
   String? token;
 
+  /// Set by the app at startup. Called when the server rejects the login token this client sent,
+  /// so the app can send the user back to the sign-in screen.
+  void Function()? onUnauthorized;
+
   /// Reads a token saved from a previous session, if any. Called once at app startup.
   Future<String?> loadSavedToken() async {
     try {
@@ -41,9 +45,10 @@ class Api {
   }
 
   Future<dynamic> _send(String method, String path, {Object? body}) async {
+    final sentToken = token; // remember which token this request used
     final req = http.Request(method, Uri.parse('$baseUrl$path'));
     req.headers['Content-Type'] = 'application/json';
-    if (token != null) req.headers['Authorization'] = 'Bearer $token';
+    if (sentToken != null) req.headers['Authorization'] = 'Bearer $sentToken';
     if (body != null) req.body = jsonEncode(body);
 
     http.Response res;
@@ -55,6 +60,13 @@ class Api {
     }
 
     if (res.statusCode >= 400) {
+      // A 401 on a request that carried our token means the server no longer accepts it (expired, or
+      // the server's signing key changed). Only the first rejected request acts: it clears the token,
+      // so any other requests still in flight with the same token are ignored.
+      if (res.statusCode == 401 && sentToken != null && sentToken == token) {
+        onUnauthorized?.call();
+        throw ApiException('Your session expired. Please sign in again.');
+      }
       var msg = 'Something went wrong (${res.statusCode}). Please try again.';
       try {
         final d = jsonDecode(utf8.decode(res.bodyBytes));
@@ -74,8 +86,17 @@ class Api {
 
   Future<List<dynamic>> accounts() async => (await _send('GET', '/accounts')) as List<dynamic>;
 
-  Future<void> linkAccount(String accountNo, String mobile) async {
-    await _send('POST', '/accounts/link', body: {'account_no': accountNo, 'mobile': mobile});
+  /// Starts linking an account. Returns true if an SMS code was sent and must be confirmed with
+  /// [confirmLinkAccount]; false if the account was linked immediately (dev mode — no SMS provider
+  /// configured on the server yet).
+  Future<bool> startLinkAccount(String accountNo, String mobile) async {
+    final d = await _send('POST', '/accounts/link/start', body: {'account_no': accountNo, 'mobile': mobile});
+    return (d as Map)['otp_required'] as bool;
+  }
+
+  Future<void> confirmLinkAccount(String accountNo, String mobile, String code) async {
+    await _send('POST', '/accounts/link/confirm',
+        body: {'account_no': accountNo, 'mobile': mobile, 'code': code});
   }
 
   Future<void> unlink(int id) async {

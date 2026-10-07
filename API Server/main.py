@@ -62,7 +62,7 @@ def _get_or_create_secret(env_name: str, filename: str) -> str:
     value = os.getenv(env_name)
     if value:
         return value
-    path = Path(filename)
+    path = _BASE_DIR / filename  # next to main.py, not the current working directory
     if path.exists():
         return path.read_text().strip()
     value = secrets.token_hex(32)
@@ -78,6 +78,14 @@ CURRENCY = "₱"
 # Set it to your real sk_test_... key (Dashboard > Developers > API Keys) to take real test-mode payments.
 PAYMONGO_SECRET_KEY = config_value("PAYMONGO_SECRET_KEY")
 PAYMONGO_BASE = "https://api.paymongo.com/v2"
+
+# Leave TEXTBEE_API_KEY unset to keep linking accounts with just a phone-number match (today's behavior,
+# no SMS code). Set it to require an SMS code too, sent through your own Android phone acting as a free
+# SMS gateway instead of a paid provider — sign up at textbee.dev, install their app on a spare phone,
+# then generate an API key on the dashboard.
+TEXTBEE_API_KEY = config_value("TEXTBEE_API_KEY")
+TEXTBEE_SEND_URL = "https://api.textbee.dev/api/v1/gateway/send-sms"
+OTP_TTL_SECONDS = 600  # textbee doesn't track an expiry itself, so this server enforces its own (10 min)
 
 engine = create_engine(f"sqlite:///{(_BASE_DIR / 'app.db').as_posix()}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
@@ -214,7 +222,7 @@ def seed() -> None:
         db.flush()
         today = date.today()
         demo = [
-            ("DEMO-000001", "DEMO, JUAN D.", "5550100001", boost, 99900),  # owes one month
+            ("DEMO-000001", "DEMO, JUAN D.", "09913187942", boost, 99900),  # owes one month; real number, for OTP testing
             ("DEMO-000002", "DEMO, MARIA S.", "5550100002", starter, -400),  # has a small credit
         ]
         for no, name, mobile, plan, balance in demo:
@@ -337,19 +345,109 @@ def login(body: Credentials, db: Session = Depends(get_db)):
 # ---------- accounts ----------
 class LinkBody(BaseModel):
     account_no: str
-    mobile: str  # must match the number on file (replace with an SMS one-time code in production)
+    mobile: str  # must match the number on file; see /accounts/link/confirm for the SMS code step
 
 
-@app.post("/api/v1/accounts/link", status_code=201)
-def link_account(body: LinkBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    rate_limit(f"link:{body.account_no}")
-    acct = db.scalar(select(Account).where(Account.account_no == body.account_no))
-    if not acct or acct.mobile != body.mobile:
+class LinkConfirmBody(BaseModel):
+    account_no: str
+    mobile: str
+    code: str
+
+
+# textbee is a plain "send this text" API — no OTP concept of its own, so this server generates the code
+# itself (unlike Semaphore, which generated one for us) and stores it with its own expiry, keyed by
+# account_no. In-memory like _rate_limit_attempts above: fine for a personal project, lost on restart,
+# not shared across multiple server instances.
+_pending_otps: dict[str, tuple[str, float]] = {}
+
+
+def _to_e164(mobile: str) -> str:
+    """PH-only: turns a local 09XXXXXXXXX number into E.164 (+63XXXXXXXXXX), which is the format
+    textbee's own examples use. Left as-is if it doesn't look like that shape (e.g. already has a +
+    prefix) — this just lets demo/testing numbers still be typed the way people normally write them."""
+    digits = mobile.strip()
+    if digits.startswith("0") and len(digits) == 11 and digits.isdigit():
+        return "+63" + digits[1:]
+    return digits
+
+
+async def _textbee_send_code(account_no: str, mobile: str) -> None:
+    """Generates a code ourselves, sends it through your Android gateway phone, and remembers it for
+    the matching /confirm call. Goes to whichever device is your default / most recently active —
+    pass a specific device's id in the payload instead if you ever run more than one."""
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    payload = {
+        "recipients": [_to_e164(mobile)],
+        "message": f"Your NetPulse verification code is {code}. It expires in 10 minutes.",
+    }
+    headers = {"x-api-key": TEXTBEE_API_KEY}
+    async with httpx.AsyncClient(timeout=15) as client:
+        res = await client.post(TEXTBEE_SEND_URL, json=payload, headers=headers)
+    if res.status_code >= 400:
+        # Surface whatever textbee actually said is wrong (bad key, phone not connected, etc.) instead
+        # of just the status code — that's the part that actually explains a failure like this.
+        raise HTTPException(502, f"textbee rejected the request ({res.status_code}): {res.text[:300]}")
+    _pending_otps[account_no] = (code, time.time() + OTP_TTL_SECONDS)
+
+
+def _check_pending_otp(account_no: str, code: str) -> bool:
+    """True only if a code was sent for this account_no, hasn't expired, and matches exactly. A correct
+    match consumes it so it can't be reused; a wrong guess can still be retried until it expires, since
+    rate_limit() above already caps how many guesses are allowed per minute."""
+    pending = _pending_otps.get(account_no)
+    if not pending:
+        return False
+    stored_code, expires_at = pending
+    if time.time() >= expires_at:
+        _pending_otps.pop(account_no, None)
+        return False
+    if not hmac.compare_digest(stored_code, code):
+        return False
+    _pending_otps.pop(account_no, None)  # one-time use once it succeeds
+    return True
+
+
+def _matching_account(db: Session, account_no: str, mobile: str) -> Account:
+    acct = db.scalar(select(Account).where(Account.account_no == account_no))
+    if not acct or acct.mobile != mobile:
         raise HTTPException(404, "No matching account")
+    return acct
+
+
+def _complete_link(db: Session, user: User, acct: Account) -> dict:
     if not db.get(Link, (user.id, acct.id)):
         db.add(Link(user_id=user.id, account_id=acct.id))
         db.commit()
     return account_view(acct, db)
+
+
+@app.post("/api/v1/accounts/link/start", status_code=201)
+async def start_link(body: LinkBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rate_limit(f"link:{body.account_no}")
+    acct = _matching_account(db, body.account_no, body.mobile)
+
+    if not TEXTBEE_API_KEY:
+        # Dev-mode fallback: no SMS gateway configured yet, so link immediately like before.
+        return {"otp_required": False, **_complete_link(db, user, acct)}
+
+    try:
+        await _textbee_send_code(body.account_no, body.mobile)
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Could not reach the SMS gateway: {e}")
+    return {"otp_required": True}
+
+
+@app.post("/api/v1/accounts/link/confirm", status_code=201)
+async def confirm_link(body: LinkConfirmBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rate_limit(f"link-confirm:{body.account_no}")
+    acct = _matching_account(db, body.account_no, body.mobile)
+
+    if not TEXTBEE_API_KEY:
+        return _complete_link(db, user, acct)  # nothing to confirm in dev mode
+
+    if not _check_pending_otp(body.account_no, body.code):
+        raise HTTPException(401, "Incorrect or expired code")
+    return _complete_link(db, user, acct)
 
 
 @app.get("/api/v1/accounts")

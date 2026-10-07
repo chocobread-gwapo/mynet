@@ -11,6 +11,10 @@ const devSimulatePayments = true; // set to false once a real payment gateway is
 
 final api = Api();
 
+// These let code without a BuildContext (like the API client) switch screens and show a message.
+final navigatorKey = GlobalKey<NavigatorState>();
+final messengerKey = GlobalKey<ScaffoldMessengerState>();
+
 // Status green and warning amber read fine on both light and dark surfaces, so these two stay
 // as fixed accent colors. Anything that needed to flip between light/dark now reads from Theme.of(context) instead.
 const _good = Color(0xFF15803D);
@@ -24,6 +28,7 @@ final _bigButton = FilledButton.styleFrom(
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initNotifications();
+  api.onUnauthorized = sessionExpired;
   runApp(const App());
 }
 
@@ -44,6 +49,18 @@ String fmtDate(String iso) {
 void signOut(BuildContext context) {
   api.clearToken(); // clears the in-memory token immediately; the storage delete finishes in the background
   Navigator.of(context).pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const LoginScreen()), (r) => false);
+}
+
+/// Called by the API client when the server rejects our saved login. Works without a BuildContext.
+void sessionExpired() {
+  api.clearToken(); // forget the rejected token right away
+  navigatorKey.currentState?.pushAndRemoveUntil(
+    MaterialPageRoute(builder: (_) => const LoginScreen()),
+    (r) => false,
+  );
+  messengerKey.currentState?.showSnackBar(
+    const SnackBar(content: Text('Your session expired. Please sign in again.')),
+  );
 }
 
 Widget kv(String k, String v, {bool bold = false}) => Padding(
@@ -266,6 +283,8 @@ class App extends StatelessWidget {
   const App({super.key});
   @override
   Widget build(BuildContext context) => MaterialApp(
+        navigatorKey: navigatorKey,
+        scaffoldMessengerKey: messengerKey,
         title: appName,
         debugShowCheckedModeBanner: false,
         themeMode: ThemeMode.system,
@@ -297,6 +316,7 @@ class _AuthGateState extends State<AuthGate> {
       await api.accounts(); // any successful call confirms the saved token still works
       _goTo(const Shell());
     } catch (_) {
+      if (api.token == null) return; // a rejected token was already cleared and you were sent to sign in
       await api.clearToken(); // expired or revoked: don't keep retrying with it
       _goTo(const LoginScreen());
     }
@@ -424,6 +444,8 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
   final _formKey = GlobalKey<FormState>();
   final _no = TextEditingController();
   final _mobile = TextEditingController();
+  final _code = TextEditingController();
+  bool _otpSent = false; // true once the server asked for a code; same form, second step
   bool _busy = false;
   String? _error;
 
@@ -434,7 +456,15 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
       _error = null;
     });
     try {
-      await api.linkAccount(_no.text.trim(), _mobile.text.trim());
+      if (!_otpSent) {
+        final otpRequired = await api.startLinkAccount(_no.text.trim(), _mobile.text.trim());
+        if (otpRequired) {
+          setState(() => _otpSent = true); // show the code field; submitting again now confirms it
+          return;
+        }
+      } else {
+        await api.confirmLinkAccount(_no.text.trim(), _mobile.text.trim(), _code.text.trim());
+      }
       await widget.onLinked();
       if (mounted && Navigator.of(context).canPop()) Navigator.of(context).pop();
     } catch (e) {
@@ -447,33 +477,53 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
   @override
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(
-          title: const Text('Link your account'),
+          title: Text(_otpSent ? 'Enter the code' : 'Link your account'),
           actions: [IconButton(tooltip: 'Sign out', icon: const Icon(Icons.logout), onPressed: () => signOut(context))],
         ),
         body: Form(
           key: _formKey,
           autovalidateMode: AutovalidateMode.onUserInteraction,
           child: ListView(padding: const EdgeInsets.all(24), children: [
-            const Text('Enter the account number on your bill and the mobile number registered to it.'),
-            const SizedBox(height: 20),
-            TextFormField(
-              controller: _no,
-              decoration: const InputDecoration(labelText: 'Account number'),
-              validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter your account number' : null,
-            ),
-            const SizedBox(height: 12),
-            TextFormField(
-              controller: _mobile,
-              keyboardType: TextInputType.phone,
-              decoration: const InputDecoration(labelText: 'Registered mobile number'),
-              validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the registered mobile number' : null,
-            ),
+            if (!_otpSent) ...[
+              const Text('Enter the account number on your bill and the mobile number registered to it.'),
+              const SizedBox(height: 20),
+              TextFormField(
+                controller: _no,
+                decoration: const InputDecoration(labelText: 'Account number'),
+                validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter your account number' : null,
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _mobile,
+                keyboardType: TextInputType.phone,
+                decoration: const InputDecoration(labelText: 'Registered mobile number'),
+                validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the registered mobile number' : null,
+              ),
+            ] else ...[
+              Text('We sent a code by SMS to ${_mobile.text.trim()}.'),
+              const SizedBox(height: 20),
+              TextFormField(
+                controller: _code,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: 'SMS code'),
+                validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the code you were sent' : null,
+              ),
+              const SizedBox(height: 8),
+              TextButton(
+                onPressed: _busy ? null : () => setState(() => _otpSent = false),
+                child: const Text('Use a different number'),
+              ),
+            ],
             if (_error != null)
               Padding(padding: const EdgeInsets.only(top: 12), child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318)))),
             const SizedBox(height: 20),
-            FilledButton(style: _bigButton, onPressed: _busy ? null : _submit, child: Text(_busy ? 'Linking...' : 'Link account')),
+            FilledButton(
+              style: _bigButton,
+              onPressed: _busy ? null : _submit,
+              child: Text(_busy ? 'Please wait...' : (_otpSent ? 'Confirm code' : 'Link account')),
+            ),
             const SizedBox(height: 16),
-            const Text('Demo data: DEMO-000001 with 5550100001, or DEMO-000002 with 5550100002.'),
+            if (!_otpSent) const Text('Demo data: DEMO-000001 with 5550100001, or DEMO-000002 with 5550100002.'),
           ]),
         ),
       );

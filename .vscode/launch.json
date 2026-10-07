@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "NetPulse API",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/API Server/main.py",
+      "cwd": "${workspaceFolder}/API Server",
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "NetPulse App",
+      "type": "dart",
+      "request": "launch",
+      "program": "lib/main.dart"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "NetPulse (API + App)",
+      "configurations": ["NetPulse API", "NetPulse App"],
+      "stopAll": true
+    }
+  ]
+}
