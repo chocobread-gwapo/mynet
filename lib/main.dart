@@ -140,24 +140,27 @@ class _LoaderState<T> extends State<Loader<T>> {
 Future<void> payNow(BuildContext context, Map<String, dynamic> acct, Future<void> Function() done) async {
   final messenger = ScaffoldMessenger.of(context);
   final amount = acct['amount_due'] as int;
-  final ok = await showDialog<bool>(
+  final channel = await showDialog<String>(
     context: context,
     builder: (c) => AlertDialog(
       title: const Text('Confirm payment'),
-      content: Text('Pay ${peso(amount)} for your ${acct['plan']['name']} plan?'),
+      content: Text("Pay ${peso(amount)} for your ${acct['plan']['name']} plan? "
+          "We'll send a code first to confirm it's you."),
       actions: [
-        TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Cancel')),
-        FilledButton(onPressed: () => Navigator.pop(c, true), child: Text('Pay ${peso(amount)}')),
+        TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel')),
+        OutlinedButton(onPressed: () => Navigator.pop(c, 'sms'), child: const Text('Verify by SMS')),
+        FilledButton(onPressed: () => Navigator.pop(c, 'email'), child: const Text('Verify by email')),
       ],
     ),
   );
-  if (ok != true) return;
-  try {
-    final started = await api.startPayment(acct['id'] as int, amount);
-    final paymentId = started['payment_id'] as int;
+  if (channel == null) return;
 
-    if (started['real'] == true) {
-      final opened = await launchUrl(Uri.parse(started['checkout_url'] as String), mode: LaunchMode.externalApplication);
+  // Shared by both paths below: once a payment has actually been started (whether that took a
+  // verification code first or not), opening the checkout / dev-mode handling is identical.
+  Future<void> openOrSimulate(Map<String, dynamic> info) async {
+    final paymentId = info['payment_id'] as int;
+    if (info['real'] == true) {
+      final opened = await launchUrl(Uri.parse(info['checkout_url'] as String), mode: LaunchMode.externalApplication);
       if (!opened) throw ApiException("Couldn't open the payment page.");
       if (context.mounted) {
         await showDialog<void>(
@@ -168,14 +171,69 @@ Future<void> payNow(BuildContext context, Map<String, dynamic> acct, Future<void
       }
       return;
     }
-
     // Dev-mode fallback: no real payment gateway configured on the server yet.
     if (devSimulatePayments) await api.devConfirm(paymentId);
     await done();
     messenger.showSnackBar(const SnackBar(content: Text('Payment received. Thank you!')));
+  }
+
+  // Shows a brief, non-dismissible spinner while a code is being sent or checked, so there's visible
+  // feedback during that gap instead of the screen looking like it just froze after picking a channel.
+  Future<T> withSpinner<T>(Future<T> Function() request) async {
+    showDialog<void>(context: context, barrierDismissible: false, builder: (_) => const Center(child: CircularProgressIndicator()));
+    try {
+      return await request();
+    } finally {
+      if (context.mounted) Navigator.of(context, rootNavigator: true).pop();
+    }
+  }
+
+  try {
+    final started = await withSpinner(() => api.startPayment(acct['id'] as int, amount, channel));
+    if (started == null) {
+      // A verification code was sent instead of starting the payment directly.
+      if (!context.mounted) return;
+      final code = await showDialog<String>(context: context, builder: (_) => _PaymentCodeDialog(channel: channel));
+      if (code == null) return;
+      final confirmed = await withSpinner(() => api.confirmPayment(acct['id'] as int, code));
+      await openOrSimulate(confirmed);
+      return;
+    }
+    await openOrSimulate(started);
   } catch (e) {
     messenger.showSnackBar(SnackBar(content: Text('$e')));
   }
+}
+
+class _PaymentCodeDialog extends StatefulWidget {
+  final String channel;
+  const _PaymentCodeDialog({required this.channel});
+
+  @override
+  State<_PaymentCodeDialog> createState() => _PaymentCodeDialogState();
+}
+
+class _PaymentCodeDialogState extends State<_PaymentCodeDialog> {
+  final _code = TextEditingController();
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: const Text('Enter the code'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          Text('We sent a code by ${widget.channel == 'sms' ? 'SMS' : 'email'}.'),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _code,
+            autofocus: true,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Verification code'),
+          ),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(context, _code.text.trim()), child: const Text('Confirm')),
+        ],
+      );
 }
 
 /// Shown after the browser opens for a real payment. Checks automatically — right away whenever
@@ -341,7 +399,9 @@ class _LoginScreenState extends State<LoginScreen> {
   final _formKey = GlobalKey<FormState>();
   final _email = TextEditingController();
   final _password = TextEditingController();
+  final _code = TextEditingController();
   bool _register = false, _busy = false, _hide = true;
+  bool _verifying = false; // true once the server asked for an email code; same form, second step
   String? _error;
 
   Future<void> _submit() async {
@@ -351,7 +411,15 @@ class _LoginScreenState extends State<LoginScreen> {
       _error = null;
     });
     try {
-      await api.login(_email.text.trim(), _password.text, register: _register);
+      if (!_verifying) {
+        final verificationRequired = await api.login(_email.text.trim(), _password.text, register: _register);
+        if (verificationRequired) {
+          setState(() => _verifying = true); // show the code field; submitting again now confirms it
+          return;
+        }
+      } else {
+        await api.confirmEmailVerification(_email.text.trim(), _code.text.trim());
+      }
       if (!mounted) return;
       Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const Shell()));
     } catch (e) {
@@ -377,37 +445,53 @@ class _LoginScreenState extends State<LoginScreen> {
                     const SizedBox(height: 8),
                     const Text('See what you owe and pay your internet bill in one tap.'),
                     const SizedBox(height: 32),
-                    TextFormField(
-                      controller: _email,
-                      keyboardType: TextInputType.emailAddress,
-                      decoration: const InputDecoration(labelText: 'Email'),
-                      validator: (v) {
-                        final value = v?.trim() ?? '';
-                        if (value.isEmpty) return 'Enter your email';
-                        if (!value.contains('@') || !value.contains('.')) return 'Enter a valid email';
-                        return null;
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    TextFormField(
-                      controller: _password,
-                      obscureText: _hide,
-                      decoration: InputDecoration(
-                        labelText: 'Password',
-                        helperText: _register ? 'At least 8 characters' : null,
-                        suffixIcon: IconButton(
-                          tooltip: _hide ? 'Show password' : 'Hide password',
-                          icon: Icon(_hide ? Icons.visibility_outlined : Icons.visibility_off_outlined),
-                          onPressed: () => setState(() => _hide = !_hide),
-                        ),
+                    if (!_verifying) ...[
+                      TextFormField(
+                        controller: _email,
+                        keyboardType: TextInputType.emailAddress,
+                        decoration: const InputDecoration(labelText: 'Email'),
+                        validator: (v) {
+                          final value = v?.trim() ?? '';
+                          if (value.isEmpty) return 'Enter your email';
+                          if (!value.contains('@') || !value.contains('.')) return 'Enter a valid email';
+                          return null;
+                        },
                       ),
-                      validator: (v) {
-                        final value = v ?? '';
-                        if (value.isEmpty) return 'Enter your password';
-                        if (value.length < 8) return 'At least 8 characters';
-                        return null;
-                      },
-                    ),
+                      const SizedBox(height: 12),
+                      TextFormField(
+                        controller: _password,
+                        obscureText: _hide,
+                        decoration: InputDecoration(
+                          labelText: 'Password',
+                          helperText: _register ? 'At least 8 characters' : null,
+                          suffixIcon: IconButton(
+                            tooltip: _hide ? 'Show password' : 'Hide password',
+                            icon: Icon(_hide ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+                            onPressed: () => setState(() => _hide = !_hide),
+                          ),
+                        ),
+                        validator: (v) {
+                          final value = v ?? '';
+                          if (value.isEmpty) return 'Enter your password';
+                          if (value.length < 8) return 'At least 8 characters';
+                          return null;
+                        },
+                      ),
+                    ] else ...[
+                      Text('We sent a code to ${_email.text.trim()}.'),
+                      const SizedBox(height: 20),
+                      TextFormField(
+                        controller: _code,
+                        keyboardType: TextInputType.number,
+                        decoration: const InputDecoration(labelText: 'Verification code'),
+                        validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the code you were sent' : null,
+                      ),
+                      const SizedBox(height: 8),
+                      TextButton(
+                        onPressed: _busy ? null : () => setState(() => _verifying = false),
+                        child: const Text('Use a different email'),
+                      ),
+                    ],
                     if (_error != null)
                       Padding(
                         padding: const EdgeInsets.only(top: 12),
@@ -417,12 +501,15 @@ class _LoginScreenState extends State<LoginScreen> {
                     FilledButton(
                       style: _bigButton,
                       onPressed: _busy ? null : _submit,
-                      child: Text(_busy ? 'Please wait...' : (_register ? 'Create account' : 'Sign in')),
+                      child: Text(_busy
+                          ? 'Please wait...'
+                          : (_verifying ? 'Confirm code' : (_register ? 'Create account' : 'Sign in'))),
                     ),
-                    TextButton(
-                      onPressed: () => setState(() => _register = !_register),
-                      child: Text(_register ? 'I already have an account' : 'Create an account'),
-                    ),
+                    if (!_verifying)
+                      TextButton(
+                        onPressed: () => setState(() => _register = !_register),
+                        child: Text(_register ? 'I already have an account' : 'Create an account'),
+                      ),
                   ]),
                 ),
               ),
@@ -523,7 +610,7 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
               child: Text(_busy ? 'Please wait...' : (_otpSent ? 'Confirm code' : 'Link account')),
             ),
             const SizedBox(height: 16),
-            if (!_otpSent) const Text('Demo data: DEMO-000001 with 5550100001, or DEMO-000002 with 5550100002.'),
+            if (!_otpSent) const Text('Demo data: DEMO-000001 with 09913187942, or DEMO-000002 with 5550100002.'),
           ]),
         ),
       );

@@ -78,9 +78,19 @@ class Api {
     return jsonDecode(utf8.decode(res.bodyBytes));
   }
 
-  Future<void> login(String email, String password, {bool register = false}) async {
+  /// Logs in or registers. Returns true if an email code was sent and must be confirmed with
+  /// [confirmEmailVerification]; false if a token came back directly (already verified, or dev mode —
+  /// no email provider configured on the server yet).
+  Future<bool> login(String email, String password, {bool register = false}) async {
     final d = await _send('POST', register ? '/auth/register' : '/auth/login',
-        body: {'email': email, 'password': password});
+        body: {'email': email, 'password': password}) as Map;
+    if (d['verification_required'] == true) return true;
+    await _saveToken(d['token'] as String);
+    return false;
+  }
+
+  Future<void> confirmEmailVerification(String email, String code) async {
+    final d = await _send('POST', '/auth/verify-email', body: {'email': email, 'code': code}) as Map;
     await _saveToken(d['token'] as String);
   }
 
@@ -140,9 +150,18 @@ class Api {
     await _send('POST', '/accounts/$id/upgrade', body: {'plan_id': planId});
   }
 
-  /// Returns payment_id, checkout_url, and real (true once a PayMongo key is configured server-side).
-  Future<Map<String, dynamic>> startPayment(int id, int amount) async {
-    final d = await _send('POST', '/accounts/$id/payments', body: {'amount': amount});
+  /// Starts a payment. Returns payment_id/checkout_url/real directly if no code was needed (dev mode —
+  /// no verification channel configured on the server yet); returns null if a code was sent and must
+  /// be confirmed with [confirmPayment].
+  Future<Map<String, dynamic>?> startPayment(int id, int amount, String channel) async {
+    final d = await _send('POST', '/accounts/$id/payments/start', body: {'amount': amount, 'channel': channel}) as Map;
+    if (d['otp_required'] == true) return null;
+    return Map<String, dynamic>.from(d);
+  }
+
+  /// Confirms a payment verification code. Returns payment_id, checkout_url, and real.
+  Future<Map<String, dynamic>> confirmPayment(int id, String code) async {
+    final d = await _send('POST', '/accounts/$id/payments/confirm', body: {'code': code});
     return Map<String, dynamic>.from(d as Map);
   }
 

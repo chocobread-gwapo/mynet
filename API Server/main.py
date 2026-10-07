@@ -11,10 +11,12 @@ import hmac
 import json
 import os
 import secrets
+import smtplib
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from email.message import EmailMessage
 from pathlib import Path
 
 import httpx
@@ -87,6 +89,15 @@ TEXTBEE_API_KEY = config_value("TEXTBEE_API_KEY")
 TEXTBEE_SEND_URL = "https://api.textbee.dev/api/v1/gateway/send-sms"
 OTP_TTL_SECONDS = 600  # textbee doesn't track an expiry itself, so this server enforces its own (10 min)
 
+# Leave SMTP_USERNAME unset to keep registering/logging in without email verification (today's
+# behavior). Set SMTP_USERNAME + SMTP_PASSWORD to require it. Easiest option: a Gmail address with an
+# "App Password" (Google Account > Security > 2-Step Verification > App passwords) — not your real
+# Gmail password, which won't work here. No signup, no approval wait, unlike the SMS providers.
+SMTP_USERNAME = config_value("SMTP_USERNAME")
+SMTP_PASSWORD = config_value("SMTP_PASSWORD")
+SMTP_HOST = config_value("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(config_value("SMTP_PORT", "587"))
+
 engine = create_engine(f"sqlite:///{(_BASE_DIR / 'app.db').as_posix()}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 
@@ -101,6 +112,7 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String, unique=True)
     password_hash: Mapped[str]
+    email_verified: Mapped[bool] = mapped_column(default=False)
 
 
 class Plan(Base):
@@ -319,6 +331,58 @@ class Credentials(BaseModel):
     password: str
 
 
+class EmailVerifyBody(BaseModel):
+    email: str
+    code: str
+
+
+# Same shape as _pending_otps for SMS, but a separate dict keyed by email instead of account_no — the
+# two verification flows are unrelated and shouldn't share a namespace.
+_pending_email_otps: dict[str, tuple[str, float]] = {}
+
+
+def _deliver_email_code(email: str, code: str) -> None:
+    """Just sends the email — callers generate the code and decide where to remember it, so this can
+    be reused for other things that need an emailed code besides registration/login."""
+    msg = EmailMessage()
+    msg["Subject"] = "Your NetPulse verification code"
+    msg["From"] = SMTP_USERNAME
+    msg["To"] = email
+    msg.set_content(f"Your NetPulse verification code is {code}. It expires in 10 minutes.")
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
+    except Exception as e:
+        # smtplib raises several different exception types (auth failure, connection refused, DNS
+        # issues...) — catching broadly and surfacing the real message beats guessing which one to expect.
+        raise HTTPException(502, f"Could not send verification email: {e}")
+
+
+def _send_email_code(email: str) -> None:
+    """Generates a code, emails it, and remembers it for the matching /verify-email call."""
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    _deliver_email_code(email, code)
+    _pending_email_otps[email] = (code, time.time() + OTP_TTL_SECONDS)
+
+
+def _check_pending_email_otp(email: str, code: str) -> bool:
+    """Same logic as _check_pending_otp for SMS: a correct match consumes it, a wrong guess can be
+    retried until it expires, rate-limited by the caller."""
+    pending = _pending_email_otps.get(email)
+    if not pending:
+        return False
+    stored_code, expires_at = pending
+    if time.time() >= expires_at:
+        _pending_email_otps.pop(email, None)
+        return False
+    if not hmac.compare_digest(stored_code, code):
+        return False
+    _pending_email_otps.pop(email, None)
+    return True
+
+
 @app.post("/api/v1/auth/register", status_code=201)
 def register(body: Credentials, db: Session = Depends(get_db)):
     email = body.email.strip().lower()
@@ -326,10 +390,14 @@ def register(body: Credentials, db: Session = Depends(get_db)):
         raise HTTPException(422, "Enter a valid email and a password of at least 8 characters")
     if db.scalar(select(User).where(User.email == email)):
         raise HTTPException(409, "Email already registered")
-    user = User(email=email, password_hash=hash_pw(body.password))
+    user = User(email=email, password_hash=hash_pw(body.password), email_verified=not SMTP_USERNAME)
     db.add(user)
     db.commit()
-    return {"token": make_token(user.id)}
+    if not SMTP_USERNAME:
+        # Dev-mode fallback: no email provider configured yet, so sign in immediately like before.
+        return {"verification_required": False, "token": make_token(user.id)}
+    _send_email_code(email)
+    return {"verification_required": True}
 
 
 @app.post("/api/v1/auth/login")
@@ -339,6 +407,23 @@ def login(body: Credentials, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.email == email))
     if not user or not check_pw(body.password, user.password_hash):
         raise HTTPException(401, "Wrong email or password")
+    if SMTP_USERNAME and not user.email_verified:
+        _send_email_code(email)  # also doubles as "resend" if they never finished verifying
+        return {"verification_required": True}
+    return {"verification_required": False, "token": make_token(user.id)}
+
+
+@app.post("/api/v1/auth/verify-email", status_code=201)
+def verify_email(body: EmailVerifyBody, db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    rate_limit(f"verify-email:{email}")
+    user = db.scalar(select(User).where(User.email == email))
+    if not user:
+        raise HTTPException(404, "No account with that email")
+    if not _check_pending_email_otp(email, body.code):
+        raise HTTPException(401, "Incorrect or expired code")
+    user.email_verified = True
+    db.commit()
     return {"token": make_token(user.id)}
 
 
@@ -371,11 +456,11 @@ def _to_e164(mobile: str) -> str:
     return digits
 
 
-async def _textbee_send_code(account_no: str, mobile: str) -> None:
-    """Generates a code ourselves, sends it through your Android gateway phone, and remembers it for
-    the matching /confirm call. Goes to whichever device is your default / most recently active —
-    pass a specific device's id in the payload instead if you ever run more than one."""
-    code = f"{secrets.randbelow(1_000_000):06d}"
+async def _deliver_sms_code(mobile: str, code: str) -> None:
+    """Just sends the SMS through your Android gateway phone — callers generate the code and decide
+    where to remember it, so this can be reused for other things that need a texted code besides
+    account linking. Goes to whichever device is your default / most recently active — pass a specific
+    device's id in the payload instead if you ever run more than one."""
     payload = {
         "recipients": [_to_e164(mobile)],
         "message": f"Your NetPulse verification code is {code}. It expires in 10 minutes.",
@@ -387,6 +472,13 @@ async def _textbee_send_code(account_no: str, mobile: str) -> None:
         # Surface whatever textbee actually said is wrong (bad key, phone not connected, etc.) instead
         # of just the status code — that's the part that actually explains a failure like this.
         raise HTTPException(502, f"textbee rejected the request ({res.status_code}): {res.text[:300]}")
+
+
+async def _textbee_send_code(account_no: str, mobile: str) -> None:
+    """Generates a code, sends it through your Android gateway phone, and remembers it for the
+    matching /confirm call."""
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    await _deliver_sms_code(mobile, code)
     _pending_otps[account_no] = (code, time.time() + OTP_TTL_SECONDS)
 
 
@@ -483,8 +575,51 @@ def billing_history(a: Account = Depends(my_account), db: Session = Depends(get_
 
 
 # ---------- payments ----------
-class PayBody(BaseModel):
+class PaymentStartBody(BaseModel):
     amount: int  # minor units (centavos)
+    channel: str  # "email" or "sms" — which verified contact to send the code to
+
+
+class PaymentConfirmBody(BaseModel):
+    code: str
+
+
+# account_id -> (code, expires_at, amount). The amount is bound to the code at send time so a confirm
+# can't complete for a different amount than what was actually verified. Separate dict from the SMS and
+# email verification ones above — unrelated flows, shouldn't share a namespace (see the comment on
+# _pending_otps).
+_pending_payment_otps: dict[int, tuple[str, float, int]] = {}
+
+
+async def _send_payment_code(a: Account, user: User, channel: str, amount: int) -> None:
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    if channel == "email":
+        if not SMTP_USERNAME:
+            raise HTTPException(400, "Email verification isn't configured on this server")
+        _deliver_email_code(user.email, code)
+    elif channel == "sms":
+        if not TEXTBEE_API_KEY:
+            raise HTTPException(400, "SMS verification isn't configured on this server")
+        await _deliver_sms_code(a.mobile, code)
+    else:
+        raise HTTPException(422, "channel must be 'email' or 'sms'")
+    _pending_payment_otps[a.id] = (code, time.time() + OTP_TTL_SECONDS, amount)
+
+
+def _check_pending_payment_otp(account_id: int, code: str) -> int | None:
+    """Returns the verified amount on a correct, unexpired match (consuming it), else None — same
+    expire/consume logic as the other two pending-code checks."""
+    pending = _pending_payment_otps.get(account_id)
+    if not pending:
+        return None
+    stored_code, expires_at, amount = pending
+    if time.time() >= expires_at:
+        _pending_payment_otps.pop(account_id, None)
+        return None
+    if not hmac.compare_digest(stored_code, code):
+        return None
+    _pending_payment_otps.pop(account_id, None)
+    return amount
 
 
 async def _create_paymongo_session(payment_id: int, amount: int, description: str) -> tuple[str, str]:
@@ -544,28 +679,52 @@ def _mark_paid(db: Session, payment: Payment) -> None:
     db.commit()
 
 
-@app.post("/api/v1/accounts/{account_id}/payments", status_code=201)
-async def start_payment(body: PayBody, a: Account = Depends(my_account), db: Session = Depends(get_db)):
-    if body.amount <= 0:
-        raise HTTPException(422, "Amount must be greater than zero")
-    payment = Payment(account_id=a.id, amount=body.amount)
+async def _begin_payment(db: Session, a: Account, amount: int) -> dict:
+    """Creates the Payment row and, if PayMongo is configured, a real checkout session. Shared by the
+    dev-mode fallback below (no verification channel configured) and the post-code-check confirm step,
+    since both end up doing exactly the same thing once they're ready to actually start the payment."""
+    payment = Payment(account_id=a.id, amount=amount)
     db.add(payment)
     db.commit()
     db.refresh(payment)
 
-    if PAYMONGO_SECRET_KEY:
-        plan = db.get(Plan, a.plan_id)
-        try:
-            session_id, checkout_url = await _create_paymongo_session(payment.id, body.amount, f"{plan.name} plan bill")
-        except httpx.HTTPError as e:
-            raise HTTPException(502, f"Could not reach the payment provider: {e}")
-        payment.gateway_session_id = session_id
-        db.commit()
-        return {"payment_id": payment.id, "status": payment.status, "checkout_url": checkout_url, "real": True}
+    if not PAYMONGO_SECRET_KEY:
+        # Dev-mode fallback: no PAYMONGO_SECRET_KEY configured yet, so keep the old one-tap simulator working.
+        return {"payment_id": payment.id, "status": payment.status,
+                "checkout_url": f"https://gateway.example/pay/{payment.id}", "real": False}
 
-    # Dev-mode fallback: no PAYMONGO_SECRET_KEY configured yet, so keep the old one-tap simulator working.
-    return {"payment_id": payment.id, "status": payment.status,
-            "checkout_url": f"https://gateway.example/pay/{payment.id}", "real": False}
+    plan = db.get(Plan, a.plan_id)
+    try:
+        session_id, checkout_url = await _create_paymongo_session(payment.id, amount, f"{plan.name} plan bill")
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Could not reach the payment provider: {e}")
+    payment.gateway_session_id = session_id
+    db.commit()
+    return {"payment_id": payment.id, "status": payment.status, "checkout_url": checkout_url, "real": True}
+
+
+@app.post("/api/v1/accounts/{account_id}/payments/start", status_code=201)
+async def start_payment(body: PaymentStartBody, a: Account = Depends(my_account),
+                         user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if body.amount <= 0:
+        raise HTTPException(422, "Amount must be greater than zero")
+
+    if not SMTP_USERNAME and not TEXTBEE_API_KEY:
+        # Dev-mode fallback: no verification channel configured yet, so pay immediately like before.
+        return {"otp_required": False, **await _begin_payment(db, a, body.amount)}
+
+    rate_limit(f"pay-start:{a.id}")
+    await _send_payment_code(a, user, body.channel, body.amount)
+    return {"otp_required": True}
+
+
+@app.post("/api/v1/accounts/{account_id}/payments/confirm", status_code=201)
+async def confirm_payment(body: PaymentConfirmBody, a: Account = Depends(my_account), db: Session = Depends(get_db)):
+    rate_limit(f"pay-confirm:{a.id}")
+    amount = _check_pending_payment_otp(a.id, body.code)
+    if amount is None:
+        raise HTTPException(401, "Incorrect or expired code")
+    return await _begin_payment(db, a, amount)
 
 
 @app.post("/api/v1/accounts/{account_id}/payments/{payment_id}/check")
