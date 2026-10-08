@@ -22,7 +22,7 @@ from pathlib import Path
 import httpx
 import jwt
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy import ForeignKey, String, create_engine, select
@@ -80,6 +80,11 @@ CURRENCY = "₱"
 # Set it to your real sk_test_... key (Dashboard > Developers > API Keys) to take real test-mode payments.
 PAYMONGO_SECRET_KEY = config_value("PAYMONGO_SECRET_KEY")
 PAYMONGO_BASE = "https://api.paymongo.com/v2"
+
+# Leave unset until you register a real webhook (Dashboard > Developers > Webhooks). This is the secret
+# PayMongo shows you there when you create it — a completely different value from WEBHOOK_SECRET above,
+# which is only for the local dev-mode simulator and is never involved in a real webhook at all.
+PAYMONGO_WEBHOOK_SECRET = config_value("PAYMONGO_WEBHOOK_SECRET")
 
 # Leave TEXTBEE_API_KEY unset to keep linking accounts with just a phone-number match (today's behavior,
 # no SMS code). Set it to require an SMS code too, sent through your own Android phone acting as a free
@@ -753,15 +758,47 @@ class WebhookBody(BaseModel):
 
 @app.post("/api/v1/webhooks/payments")
 def payment_webhook(body: WebhookBody, x_webhook_secret: str = Header(""), db: Session = Depends(get_db)):
-    """Called by the dev-mode simulator below, never by PayMongo. A real PayMongo webhook needs a public
-    URL and its own signature verification (HMAC-SHA256 over the Paymongo-Signature header) — a good next
-    step once this is deployed somewhere reachable from the internet, instead of the status-check endpoint."""
+    """Called by the dev-mode simulator below, never by PayMongo — see /webhooks/paymongo for the real one."""
     if not hmac.compare_digest(x_webhook_secret.encode(), WEBHOOK_SECRET.encode()):
         raise HTTPException(401, "Bad webhook secret")
     payment = db.get(Payment, body.payment_id)
     if not payment:
         raise HTTPException(404, "Unknown payment")
     _mark_paid(db, payment)
+    return {"ok": True}
+
+
+def _paymongo_signature_valid(raw_body: bytes, signature_header: str) -> bool:
+    """Verifies a real incoming PayMongo webhook. Per https://developers.paymongo.com/docs/securing-webhook:
+    the Paymongo-Signature header is "t=<timestamp>,te=<test sig>,li=<live sig>"; the expected signature is
+    HMAC-SHA256 of "{timestamp}.{raw body}" using the webhook's own secret, checked against te for test mode
+    (always te here, since this project only ever uses sk_test_ keys) or li for live mode."""
+    parts = dict(p.split("=", 1) for p in signature_header.split(",") if "=" in p)
+    timestamp, their_signature = parts.get("t"), parts.get("te")
+    if not timestamp or not their_signature or not PAYMONGO_WEBHOOK_SECRET:
+        return False
+    signed_payload = f"{timestamp}.".encode() + raw_body
+    expected = hmac.new(PAYMONGO_WEBHOOK_SECRET.encode(), signed_payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, their_signature)
+
+
+@app.post("/api/v1/webhooks/paymongo")
+async def paymongo_webhook(request: Request, db: Session = Depends(get_db)):
+    """The real PayMongo webhook. Register this URL under Dashboard > Developers > Webhooks once this
+    server has a public address, subscribed to checkout_session.payment.paid. The raw body has to be read
+    before any JSON parsing — signature verification is computed over the exact bytes PayMongo sent, and
+    re-serializing a parsed body can change whitespace and break the match even when the content is identical."""
+    raw_body = await request.body()
+    if not _paymongo_signature_valid(raw_body, request.headers.get("paymongo-signature", "")):
+        raise HTTPException(401, "Bad webhook signature")
+
+    event = json.loads(raw_body)["data"]
+    if event.get("type") == "checkout_session.payment.paid":
+        session_id = event["data"]["id"]  # cs_xxx
+        payment = db.scalar(select(Payment).where(Payment.gateway_session_id == session_id))
+        if payment:
+            _mark_paid(db, payment)
+    # 2xx for anything else too (events this project doesn't act on) — otherwise PayMongo keeps retrying.
     return {"ok": True}
 
 
@@ -893,7 +930,7 @@ def unsubscribe_addon(addon_id: int, a: Account = Depends(my_account), db: Sessi
 
 if __name__ == "__main__":
     # Lets VS Code's Run/F5 button start the server directly — equivalent to running
-    # `uvicorn main:app --reload` by hand. Only runs when this file is executed directly,
+    # ` main:appuvicorn --reload` by hand. Only runs when this file is executed directly,
     # never when something else imports it (e.g. the test suite), so nothing else changes.
     import uvicorn
 
