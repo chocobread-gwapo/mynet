@@ -10,6 +10,10 @@ import 'notifications.dart';
 const appName = 'NetPulse';
 const devSimulatePayments = true; // set to false once a real payment gateway is connected
 
+/// How long the app can sit in the background before a login made WITHOUT "Remember me" is ended.
+/// Change the number to taste; it has no effect on logins that did tick "Remember me".
+const backgroundLogoutAfter = Duration(minutes: 5);
+
 /// The Web OAuth client ID from Google Cloud Console (APIs & Services > Credentials) — the same value
 /// GOOGLE_CLIENT_ID is set to on the server (they must match: the server checks the token was issued
 /// for this exact client). Leave the placeholder in and the Google button shows a clear error when
@@ -36,7 +40,32 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initNotifications();
   api.onUnauthorized = sessionExpired;
+  WidgetsBinding.instance.addObserver(_BackgroundLogout());
   runApp(const App());
+}
+
+/// Ends a "Remember me"-unticked login once the app has been out of sight for [backgroundLogoutAfter].
+/// Timers don't run reliably while an app is in the background, so this just notes when the app was
+/// hidden and compares the clock the moment it comes back. (If Android kills the app in the meantime,
+/// the in-memory login is already gone, so there's nothing left to end.)
+class _BackgroundLogout with WidgetsBindingObserver {
+  DateTime? _leftAt;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.hidden || state == AppLifecycleState.paused) {
+      _leftAt ??= DateTime.now(); // keep the first moment it left, not the later paused one
+    } else if (state == AppLifecycleState.resumed) {
+      final left = _leftAt;
+      _leftAt = null;
+      if (left != null &&
+          api.sessionOnly &&
+          api.token != null &&
+          DateTime.now().difference(left) >= backgroundLogoutAfter) {
+        sessionTimedOut();
+      }
+    }
+  }
 }
 
 // ---------- helpers ----------
@@ -67,6 +96,19 @@ void sessionExpired() {
   );
   messengerKey.currentState?.showSnackBar(
     const SnackBar(content: Text('Your session expired. Please sign in again.')),
+  );
+}
+
+/// Like [sessionExpired], but for a login that was ended because the app sat in the background too long.
+/// Replacing every route also closes any dialog that was open.
+void sessionTimedOut() {
+  api.clearToken();
+  navigatorKey.currentState?.pushAndRemoveUntil(
+    MaterialPageRoute(builder: (_) => const LoginScreen()),
+    (r) => false,
+  );
+  messengerKey.currentState?.showSnackBar(
+    const SnackBar(content: Text('You were signed out after being away for a while. Please sign in again.')),
   );
 }
 
@@ -551,9 +593,10 @@ class _AuthGateState extends State<AuthGate> {
       await api.accounts(); // any successful call confirms the saved token still works
       _goTo(const Shell());
     } catch (_) {
-      if (api.token == null) return; // a rejected token was already cleared and you were sent to sign in
-      await api.clearToken(); // expired or revoked: don't keep retrying with it
-      _goTo(const LoginScreen());
+      if (api.token == null) return; // the server rejected the token: it's already cleared and you were sent to sign in
+      // Anything else (server off or unreachable, a bad Wi-Fi moment) says nothing about the login itself,
+      // so keep it: the home screen shows the problem with a Try again button instead of signing you out.
+      _goTo(const Shell());
     }
   }
 
@@ -579,15 +622,31 @@ class _LoginScreenState extends State<LoginScreen> {
   final _code = TextEditingController();
   bool _register = false, _busy = false, _hide = true;
   bool _verifying = false; // true once the server asked for an email code; same form, second step
+  bool _remember = false; // the "Remember me" box (starts unticked): stay signed in after the app closes
   String? _error;
 
   @override
   void initState() {
     super.initState();
+    _loadRememberMe();
     // Only this screen needs Google Sign-In, so it's initialized here rather than in main() — nothing
     // else in the app touches it. A problem here (e.g. a misconfigured client ID) surfaces when the
     // button is actually tapped, via the try/catch in _signInWithGoogle, rather than crashing startup.
     unawaited(GoogleSignIn.instance.initialize(serverClientId: googleServerClientId));
+  }
+
+  /// Puts the "Remember me" box back the way it was left. (The email field is never pre-filled: it
+  /// always starts empty.)
+  Future<void> _loadRememberMe() async {
+    final remember = await api.loadRememberMe();
+    if (mounted) setState(() => _remember = remember);
+  }
+
+  /// Ticks or unticks the box and saves that straight away, so it's still as left even if the app is
+  /// closed without signing in.
+  void _setRemember(bool value) {
+    setState(() => _remember = value);
+    unawaited(api.saveRememberMe(value));
   }
 
   Future<void> _submit() async {
@@ -598,13 +657,14 @@ class _LoginScreenState extends State<LoginScreen> {
     });
     try {
       if (!_verifying) {
-        final verificationRequired = await api.login(_email.text.trim(), _password.text, register: _register);
+        final verificationRequired =
+            await api.login(_email.text.trim(), _password.text, register: _register, remember: _remember);
         if (verificationRequired) {
           setState(() => _verifying = true); // show the code field; submitting again now confirms it
           return;
         }
       } else {
-        await api.confirmEmailVerification(_email.text.trim(), _code.text.trim());
+        await api.confirmEmailVerification(_email.text.trim(), _code.text.trim(), remember: _remember);
       }
       if (!mounted) return;
       Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const Shell()));
@@ -625,7 +685,7 @@ class _LoginScreenState extends State<LoginScreen> {
       final account = await GoogleSignIn.instance.authenticate();
       final idToken = account.authentication.idToken;
       if (idToken == null) throw ApiException("Google didn't return a usable sign-in token.");
-      await api.loginWithGoogle(idToken);
+      await api.loginWithGoogle(idToken, remember: _remember);
       if (!mounted) return;
       Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const Shell()));
     } on GoogleSignInException catch (e) {
@@ -687,13 +747,41 @@ class _LoginScreenState extends State<LoginScreen> {
                           return null;
                         },
                       ),
+                      Row(children: [
+                        Expanded(
+                          child: Align(
+                            alignment: Alignment.centerLeft,
+                            child: InkWell(
+                              borderRadius: BorderRadius.circular(8),
+                              onTap: _busy ? null : () => _setRemember(!_remember),
+                              child: Row(mainAxisSize: MainAxisSize.min, children: [
+                                Checkbox(
+                                  value: _remember,
+                                  onChanged: _busy ? null : (v) => _setRemember(v ?? false),
+                                ),
+                                const Text('Remember me'),
+                                const SizedBox(width: 8),
+                              ]),
+                            ),
+                          ),
+                        ),
+                        if (!_register)
+                          TextButton(
+                            onPressed: _busy
+                                ? null
+                                : () => Navigator.of(context).push(MaterialPageRoute(
+                                    builder: (_) => ForgotPasswordScreen(initialEmail: _email.text.trim()))),
+                            child: const Text('Forgot password?'),
+                          ),
+                      ]),
                     ] else ...[
                       stepTwoDots(context),
                       CodeEntry(
                         controller: _code,
                         description: 'We sent a code to ${_email.text.trim()}.',
                         busy: _busy,
-                        onResend: () => api.login(_email.text.trim(), _password.text, register: _register),
+                        onResend: () =>
+                            api.login(_email.text.trim(), _password.text, register: _register, remember: _remember),
                         validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the code you were sent' : null,
                       ),
                       const SizedBox(height: 4),
@@ -759,6 +847,136 @@ class _LoginScreenState extends State<LoginScreen> {
                 ),
               ),
             ),
+          ),
+        ),
+      );
+}
+
+// ---------- forgot password ----------
+/// Two steps on one screen, like login's email-code step: enter the email, then the emailed code plus
+/// a new password. A successful reset does NOT sign the user in: it sends them back to the login screen
+/// to sign in with the new password (the server has ended all their old logins by then anyway).
+class ForgotPasswordScreen extends StatefulWidget {
+  final String initialEmail; // carried over from whatever was already typed on the login screen
+  const ForgotPasswordScreen({super.key, this.initialEmail = ''});
+  @override
+  State<ForgotPasswordScreen> createState() => _ForgotPasswordScreenState();
+}
+
+class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
+  final _formKey = GlobalKey<FormState>();
+  late final _email = TextEditingController(text: widget.initialEmail);
+  final _code = TextEditingController();
+  final _password = TextEditingController();
+  bool _codeSent = false, _busy = false, _hide = true;
+  String? _error;
+
+  @override
+  void dispose() {
+    _email.dispose();
+    _code.dispose();
+    _password.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      if (!_codeSent) {
+        await api.requestPasswordReset(_email.text.trim());
+        if (mounted) setState(() => _codeSent = true); // show the code + new password fields
+        return;
+      }
+      await api.resetPassword(_email.text.trim(), _code.text.trim(), _password.text);
+      if (!mounted) return;
+      // A fresh, empty login screen, replacing this screen and the old login one.
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+        (r) => false,
+      );
+      messengerKey.currentState?.showSnackBar(
+        const SnackBar(content: Text('Password reset. Please sign in with your new password.')),
+      );
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: Text(_codeSent ? 'Enter the code' : 'Reset password')),
+        body: SafeArea(
+          child: Form(
+            key: _formKey,
+            autovalidateMode: AutovalidateMode.onUserInteraction,
+            child: ListView(padding: const EdgeInsets.all(24), children: [
+              if (!_codeSent) ...[
+                const Text("Enter the email you signed up with and we'll send you a code to reset your password."),
+                const SizedBox(height: 20),
+                TextFormField(
+                  controller: _email,
+                  keyboardType: TextInputType.emailAddress,
+                  decoration: const InputDecoration(labelText: 'Email'),
+                  validator: (v) {
+                    final value = v?.trim() ?? '';
+                    if (value.isEmpty) return 'Enter your email';
+                    if (!value.contains('@') || !value.contains('.')) return 'Enter a valid email';
+                    return null;
+                  },
+                ),
+              ] else ...[
+                stepTwoDots(context),
+                CodeEntry(
+                  controller: _code,
+                  description: 'We sent a code to ${_email.text.trim()}.',
+                  busy: _busy,
+                  onResend: () => api.requestPasswordReset(_email.text.trim()),
+                  validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the code you were sent' : null,
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _password,
+                  obscureText: _hide,
+                  decoration: InputDecoration(
+                    labelText: 'New password',
+                    helperText: 'At least 8 characters',
+                    suffixIcon: IconButton(
+                      tooltip: _hide ? 'Show password' : 'Hide password',
+                      icon: Icon(_hide ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+                      onPressed: () => setState(() => _hide = !_hide),
+                    ),
+                  ),
+                  validator: (v) {
+                    final value = v ?? '';
+                    if (value.isEmpty) return 'Enter a new password';
+                    if (value.length < 8) return 'At least 8 characters';
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 4),
+                TextButton(
+                  onPressed: _busy ? null : () => setState(() => _codeSent = false),
+                  child: const Text('Use a different email'),
+                ),
+              ],
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318))),
+                ),
+              const SizedBox(height: 20),
+              FilledButton(
+                style: _bigButton,
+                onPressed: _busy ? null : _submit,
+                child: Text(_busy ? 'Please wait...' : (_codeSent ? 'Reset password' : 'Send code')),
+              ),
+            ]),
           ),
         ),
       );

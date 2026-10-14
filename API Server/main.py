@@ -24,7 +24,7 @@ import jwt
 from dotenv import load_dotenv
 from google.auth.transport import requests as google_auth_transport
 from google.oauth2 import id_token as google_id_token
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from sqlalchemy import ForeignKey, String, create_engine, select
@@ -295,9 +295,17 @@ def check_pw(pw: str, stored: str) -> bool:
     return hmac.compare_digest(digest, digest_hex)
 
 
-def make_token(user_id: int) -> str:
+def _pw_version(user: User) -> str:
+    """A short fingerprint of the user's current password hash, stamped into every login token. Changing
+    the password changes the hash (fresh random salt each time), so every token issued before the change
+    stops matching and is rejected — that's what signs a user out everywhere after a password reset,
+    without needing a new database column."""
+    return hashlib.sha256((user.password_hash or "").encode()).hexdigest()[:16]
+
+
+def make_token(user: User) -> str:
     exp = datetime.now(timezone.utc) + timedelta(days=30)  # was 12 hours; mobile apps expect to stay signed in
-    return jwt.encode({"sub": str(user_id), "exp": exp}, JWT_SECRET, algorithm="HS256")
+    return jwt.encode({"sub": str(user.id), "exp": exp, "pv": _pw_version(user)}, JWT_SECRET, algorithm="HS256")
 
 
 bearer = HTTPBearer()
@@ -305,12 +313,16 @@ bearer = HTTPBearer()
 
 def current_user(creds: HTTPAuthorizationCredentials = Depends(bearer), db: Session = Depends(get_db)) -> User:
     try:
-        user_id = int(jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])["sub"])
+        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
+        user_id = int(payload["sub"])
     except (jwt.PyJWTError, KeyError, ValueError):
         raise HTTPException(401, "Invalid or expired token")
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(401, "Unknown user")
+    # A token from before the password last changed (or from before this check existed) doesn't match.
+    if payload.get("pv") != _pw_version(user):
+        raise HTTPException(401, "Invalid or expired token")
     return user
 
 
@@ -361,14 +373,15 @@ class EmailVerifyBody(BaseModel):
 _pending_email_otps: dict[str, tuple[str, float]] = {}
 
 
-def _deliver_email_code(email: str, code: str) -> None:
+def _deliver_email_code(email: str, code: str, subject: str = "Your NetPulse verification code",
+                        message: str | None = None) -> None:
     """Just sends the email — callers generate the code and decide where to remember it, so this can
     be reused for other things that need an emailed code besides registration/login."""
     msg = EmailMessage()
-    msg["Subject"] = "Your NetPulse verification code"
+    msg["Subject"] = subject
     msg["From"] = SMTP_USERNAME
     msg["To"] = email
-    msg.set_content(f"Your NetPulse verification code is {code}. It expires in 10 minutes.")
+    msg.set_content(message or f"Your NetPulse verification code is {code}. It expires in 10 minutes.")
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
             server.starttls()
@@ -415,7 +428,7 @@ def register(body: Credentials, db: Session = Depends(get_db)):
     db.commit()
     if not SMTP_USERNAME:
         # Dev-mode fallback: no email provider configured yet, so sign in immediately like before.
-        return {"verification_required": False, "token": make_token(user.id)}
+        return {"verification_required": False, "token": make_token(user)}
     _send_email_code(email)
     return {"verification_required": True}
 
@@ -432,7 +445,7 @@ def login(body: Credentials, db: Session = Depends(get_db)):
     if SMTP_USERNAME and not user.email_verified:
         _send_email_code(email)  # also doubles as "resend" if they never finished verifying
         return {"verification_required": True}
-    return {"verification_required": False, "token": make_token(user.id)}
+    return {"verification_required": False, "token": make_token(user)}
 
 
 @app.post("/api/v1/auth/verify-email", status_code=201)
@@ -446,7 +459,131 @@ def verify_email(body: EmailVerifyBody, db: Session = Depends(get_db)):
         raise HTTPException(401, "Incorrect or expired code")
     user.email_verified = True
     db.commit()
-    return {"token": make_token(user.id)}
+    return {"token": make_token(user)}
+
+
+class ForgotPasswordBody(BaseModel):
+    email: str
+
+
+class ResetPasswordBody(BaseModel):
+    email: str
+    code: str
+    new_password: str
+
+
+# Reset codes, kept apart from the registration-verification ones above: unrelated flows, and a code
+# emailed for one must never work for the other.
+_pending_reset_otps: dict[str, tuple[str, float]] = {}
+
+
+def _check_pending_reset_otp(email: str, code: str) -> bool:
+    """Same expire/consume logic as _check_pending_email_otp, against the reset codes."""
+    pending = _pending_reset_otps.get(email)
+    if not pending:
+        return False
+    stored_code, expires_at = pending
+    if time.time() >= expires_at:
+        _pending_reset_otps.pop(email, None)
+        return False
+    if not hmac.compare_digest(stored_code, code):
+        return False
+    _pending_reset_otps.pop(email, None)  # one-time use once it succeeds
+    return True
+
+
+def _send_reset_email(email: str, code: str) -> None:
+    """Runs after the HTTP response has already gone out (see forgot_password), so a send failure can't
+    change what the caller sees — it's printed to the server console instead."""
+    try:
+        _deliver_email_code(
+            email, code,
+            subject="Reset your NetPulse password",
+            message=f"Your NetPulse password reset code is {code}. It expires in 10 minutes.\n\n"
+                    "If you didn't ask to reset your password, you can ignore this email.",
+        )
+    except HTTPException as e:
+        print(f"[password reset] could not email {email}: {e.detail}")
+
+
+@app.post("/api/v1/auth/forgot-password")
+def forgot_password(body: ForgotPasswordBody, background: BackgroundTasks, db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    rate_limit(f"forgot:{email}", max_attempts=3)  # also keeps this from being used to spam someone's inbox
+    user = db.scalar(select(User).where(User.email == email))
+    if not user:
+        # Says so plainly, so a mistyped email is obvious right away. (register already says "Email already
+        # registered", so this doesn't reveal anything new; the 3-per-minute limit above slows down anyone
+        # trying to probe for accounts.)
+        raise HTTPException(404, "We couldn't find an account with that email. Check the spelling, or create an account.")
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    _pending_reset_otps[email] = (code, time.time() + OTP_TTL_SECONDS)
+    if SMTP_USERNAME:
+        # Sent in the background so the app isn't left waiting on the mail server; a failure is printed
+        # to the console by _send_reset_email.
+        background.add_task(_send_reset_email, email, code)
+    else:
+        # Dev-mode fallback: no email provider configured yet, so show the code here instead.
+        print(f"[password reset] code for {email}: {code}")
+    return {"ok": True}
+
+
+def _send_password_changed_email(email: str) -> None:
+    """Background task: a heads-up that the password just changed, so a reset the owner didn't ask for
+    gets noticed. Failures are printed to the console, never raised."""
+    when = datetime.now(timezone(timedelta(hours=8))).strftime("%b %d, %Y at %I:%M %p")  # Philippine time
+    try:
+        _deliver_email_code(
+            email, "",
+            subject="Your NetPulse password was changed",
+            message=f"The password for your NetPulse account was just changed ({when}, Philippine time).\n\n"
+                    "If this was you, no action is needed.\n"
+                    "If it wasn't, open NetPulse and tap Forgot password to reset it again right away.",
+        )
+    except HTTPException as e:
+        print(f"[password reset] could not email the change notice to {email}: {e.detail}")
+
+
+async def _send_password_changed_sms(mobile: str) -> None:
+    """Background task: the same heads-up by text, to a number on one of the user's linked accounts."""
+    try:
+        await _deliver_sms_code(
+            mobile, "",
+            message="NetPulse: your password was just changed. If this wasn't you, use Forgot password in the app now.",
+        )
+    except (HTTPException, httpx.HTTPError) as e:
+        print(f"[password reset] could not text the change notice to {mobile}: {getattr(e, 'detail', e)}")
+
+
+@app.post("/api/v1/auth/reset-password")
+def reset_password(body: ResetPasswordBody, background: BackgroundTasks, db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    rate_limit(f"reset:{email}")
+    if len(body.new_password) < 8:
+        raise HTTPException(422, "Password must be at least 8 characters")
+    user = db.scalar(select(User).where(User.email == email))
+    # An unknown email never has a pending code, so it fails exactly like a wrong or expired one.
+    if not user or not _check_pending_reset_otp(email, body.code.strip()):
+        raise HTTPException(401, "Incorrect or expired code")
+    user.password_hash = hash_pw(body.new_password)  # also gives a Google-only account a password
+    user.email_verified = True  # they just proved they can read this inbox
+    db.commit()
+    # No token comes back: the new hash already invalidated every login this user had (see _pw_version),
+    # so they sign in again with the new password.
+
+    # Tell the owner by email and by text. Users have no phone number of their own here — numbers live on
+    # the accounts they've linked — so the text goes to each distinct number on those.
+    mobiles = sorted({a.mobile for a in db.scalars(
+        select(Account).join(Link, Link.account_id == Account.id).where(Link.user_id == user.id))})
+    if SMTP_USERNAME:
+        background.add_task(_send_password_changed_email, user.email)
+    if TEXTBEE_API_KEY:
+        for mobile in mobiles:
+            background.add_task(_send_password_changed_sms, mobile)
+    if not SMTP_USERNAME and not TEXTBEE_API_KEY:
+        # Dev-mode fallback: no providers configured yet, so just show what would have been sent.
+        print(f"[password reset] would notify {user.email} by email and {mobiles or 'no linked numbers'} by SMS")
+    return {"ok": True}
 
 
 class GoogleSignInBody(BaseModel):
@@ -488,7 +625,7 @@ def google_sign_in(body: GoogleSignInBody, db: Session = Depends(get_db)):
             user = User(email=email, email_verified=True, google_sub=google_sub)
             db.add(user)
         db.commit()
-    return {"token": make_token(user.id)}
+    return {"token": make_token(user)}
 
 
 # ---------- accounts ----------
@@ -520,14 +657,15 @@ def _to_e164(mobile: str) -> str:
     return digits
 
 
-async def _deliver_sms_code(mobile: str, code: str) -> None:
+async def _deliver_sms_code(mobile: str, code: str, message: str | None = None) -> None:
     """Just sends the SMS through your Android gateway phone — callers generate the code and decide
     where to remember it, so this can be reused for other things that need a texted code besides
-    account linking. Goes to whichever device is your default / most recently active — pass a specific
-    device's id in the payload instead if you ever run more than one."""
+    account linking (or, with [message], a plain notice that has no code). Goes to whichever device is
+    your default / most recently active — pass a specific device's id in the payload instead if you
+    ever run more than one."""
     payload = {
         "recipients": [_to_e164(mobile)],
-        "message": f"Your NetPulse verification code is {code}. It expires in 10 minutes.",
+        "message": message or f"Your NetPulse verification code is {code}. It expires in 10 minutes.",
     }
     headers = {"x-api-key": TEXTBEE_API_KEY}
     async with httpx.AsyncClient(timeout=15) as client:

@@ -10,6 +10,8 @@ import 'package:http/http.dart' as http;
 const String baseUrl = 'http://192.168.18.19:8000/api/v1';
 
 const _tokenKey = 'auth_token';
+const _oldEmailKey = 'remembered_email'; // an earlier version saved the email here; it's only cleaned up now
+const _rememberKey = 'remember_me'; // '1' or '0': the box's state at the last sign-in
 const _storage = FlutterSecureStorage();
 
 class ApiException implements Exception {
@@ -21,6 +23,10 @@ class ApiException implements Exception {
 
 class Api {
   String? token;
+
+  /// True while the current login is the in-memory-only kind ("Remember me" was unticked). Those logins
+  /// are also ended after the app has been in the background for a while (see _BackgroundLogout in main.dart).
+  bool sessionOnly = false;
 
   /// Set by the app at startup. Called when the server rejects the login token this client sent,
   /// so the app can send the user back to the sign-in screen.
@@ -35,14 +41,43 @@ class Api {
     }
   }
 
-  Future<void> _saveToken(String value) async {
+  /// With [persist] false (the "Remember me" box is unticked) the token lives in memory only: it works
+  /// until the app is closed, and any copy saved by an earlier sign-in is removed so it can't outlive that.
+  Future<void> _saveToken(String value, {bool persist = true}) async {
     token = value;
-    await _storage.write(key: _tokenKey, value: value);
+    sessionOnly = !persist;
+    if (persist) {
+      await _storage.write(key: _tokenKey, value: value);
+    } else {
+      await _storage.delete(key: _tokenKey);
+    }
+  }
+
+  /// Whether "Remember me" was ticked at the last sign-in. False when nothing is saved, so the box
+  /// starts unticked until someone chooses otherwise. Also deletes the email an earlier version of the
+  /// app saved for pre-filling the login screen: the app no longer remembers or fills in emails.
+  Future<bool> loadRememberMe() async {
+    try {
+      await _storage.delete(key: _oldEmailKey);
+      return await _storage.read(key: _rememberKey) == '1';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Saves the state of the "Remember me" box, so it's still as it was left next time.
+  Future<void> saveRememberMe(bool remember) async {
+    try {
+      await _storage.write(key: _rememberKey, value: remember ? '1' : '0');
+    } catch (_) {
+      // Convenience only: never fail a sign-in over it.
+    }
   }
 
   /// Clears both the in-memory token and the saved copy. Safe to call without awaiting.
   Future<void> clearToken() async {
     token = null;
+    sessionOnly = false;
     await _storage.delete(key: _tokenKey);
   }
 
@@ -83,25 +118,40 @@ class Api {
   /// Logs in or registers. Returns true if an email code was sent and must be confirmed with
   /// [confirmEmailVerification]; false if a token came back directly (already verified, or dev mode —
   /// no email provider configured on the server yet).
-  Future<bool> login(String email, String password, {bool register = false}) async {
+  /// [remember] false keeps the resulting login in memory only (see [_saveToken]).
+  Future<bool> login(String email, String password, {bool register = false, bool remember = false}) async {
     final d = await _send('POST', register ? '/auth/register' : '/auth/login',
         body: {'email': email, 'password': password}) as Map;
     if (d['verification_required'] == true) return true;
-    await _saveToken(d['token'] as String);
+    await _saveToken(d['token'] as String, persist: remember);
     return false;
   }
 
-  Future<void> confirmEmailVerification(String email, String code) async {
+  Future<void> confirmEmailVerification(String email, String code, {bool remember = false}) async {
     final d = await _send('POST', '/auth/verify-email', body: {'email': email, 'code': code}) as Map;
-    await _saveToken(d['token'] as String);
+    await _saveToken(d['token'] as String, persist: remember);
+  }
+
+  /// Asks the server to email a password-reset code. Throws an [ApiException] saying so if no account
+  /// uses that email.
+  Future<void> requestPasswordReset(String email) async {
+    await _send('POST', '/auth/forgot-password', body: {'email': email});
+  }
+
+  /// Confirms the emailed code and sets the new password. Doesn't sign the user in: the server ends every
+  /// existing login on a reset, so this also drops any token saved on this device, and the caller sends
+  /// the user back to sign in with the new password.
+  Future<void> resetPassword(String email, String code, String newPassword) async {
+    await _send('POST', '/auth/reset-password', body: {'email': email, 'code': code, 'new_password': newPassword});
+    await clearToken();
   }
 
   /// Signs in (or silently registers, on a first-ever Google sign-in) with a Google ID token obtained
   /// via GoogleSignIn. Google has already verified the email, so — unlike [login] — this always
   /// returns a token directly; there's no verification_required step to handle.
-  Future<void> loginWithGoogle(String googleIdToken) async {
+  Future<void> loginWithGoogle(String googleIdToken, {bool remember = false}) async {
     final d = await _send('POST', '/auth/google', body: {'id_token': googleIdToken}) as Map;
-    await _saveToken(d['token'] as String);
+    await _saveToken(d['token'] as String, persist: remember);
   }
 
   Future<List<dynamic>> accounts() async => (await _send('GET', '/accounts')) as List<dynamic>;
