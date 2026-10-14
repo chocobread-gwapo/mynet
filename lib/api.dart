@@ -3,9 +3,11 @@ import 'dart:convert';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
-/// The Android emulator reaches your PC's localhost at 10.0.2.2.
-/// On a real phone, use your PC's address on the same Wi-Fi, e.g. http://192.168.1.20:8000/api/v1
-const String baseUrl = 'http://10.0.2.2:8000/api/v1';
+/// The Android emulator reaches your PC's localhost at the special address 10.0.2.2 — that's what
+/// this pointed at before. A real phone instead needs your PC's own address on the local network
+/// (find it with ipconfig; Wi-Fi or Ethernet both work, as long as the phone's Wi-Fi is on the same
+/// router). Switch this back to 'http://10.0.2.2:8000/api/v1' if you go back to the emulator.
+const String baseUrl = 'http://192.168.18.19:8000/api/v1';
 
 const _tokenKey = 'auth_token';
 const _storage = FlutterSecureStorage();
@@ -91,6 +93,14 @@ class Api {
 
   Future<void> confirmEmailVerification(String email, String code) async {
     final d = await _send('POST', '/auth/verify-email', body: {'email': email, 'code': code}) as Map;
+    await _saveToken(d['token'] as String);
+  }
+
+  /// Signs in (or silently registers, on a first-ever Google sign-in) with a Google ID token obtained
+  /// via GoogleSignIn. Google has already verified the email, so — unlike [login] — this always
+  /// returns a token directly; there's no verification_required step to handle.
+  Future<void> loginWithGoogle(String googleIdToken) async {
+    final d = await _send('POST', '/auth/google', body: {'id_token': googleIdToken}) as Map;
     await _saveToken(d['token'] as String);
   }
 

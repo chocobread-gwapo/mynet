@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:google_sign_in/google_sign_in.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'api.dart';
@@ -8,6 +9,12 @@ import 'notifications.dart';
 
 const appName = 'NetPulse';
 const devSimulatePayments = true; // set to false once a real payment gateway is connected
+
+/// The Web OAuth client ID from Google Cloud Console (APIs & Services > Credentials) — the same value
+/// GOOGLE_CLIENT_ID is set to on the server (they must match: the server checks the token was issued
+/// for this exact client). Leave the placeholder in and the Google button shows a clear error when
+/// tapped instead of breaking anything else in the app.
+const googleServerClientId = '525298506900-qppp3bqo9i0f94jqol667fo3v4qf6c7l.apps.googleusercontent.com';
 
 final api = Api();
 
@@ -84,6 +91,112 @@ Widget statusChip(String status) {
   );
 }
 
+/// Two small dots marking "step 2 of 2" on a form that only grows a second step once the server
+/// actually asks for a code (dev mode, with no SMS/email provider configured, never shows it at all).
+Widget stepTwoDots(BuildContext context) {
+  final scheme = Theme.of(context).colorScheme;
+  Widget dot(bool current) => Container(
+        width: 8,
+        height: 8,
+        margin: const EdgeInsets.only(right: 6),
+        decoration: BoxDecoration(shape: BoxShape.circle, color: current ? scheme.primary : scheme.outlineVariant),
+      );
+  return Padding(
+    padding: const EdgeInsets.only(bottom: 16),
+    // Step 1 (details just entered) shown muted/behind us; step 2 (code entry, right now) highlighted.
+    child: Row(mainAxisSize: MainAxisSize.min, children: [dot(false), dot(true)]),
+  );
+}
+
+/// Shared "enter the code we sent" block used by login/register (email), account linking (SMS), and
+/// payment confirmation (either). Shows a live 10-minute countdown matching the server's OTP_TTL_SECONDS,
+/// and a resend link — calling [onResend] re-sends a fresh code through the same endpoint that sent the
+/// first one, which is all a "resend" is server-side (see confirm_payment/confirm_link/login's comments).
+class CodeEntry extends StatefulWidget {
+  final TextEditingController controller;
+  final String description; // full sentence, e.g. "We sent a code to jozua@gmail.com."
+  final Future<void> Function() onResend;
+  final bool busy; // disables Resend while the parent form's main action is already in flight
+  final String? Function(String?)? validator; // left null outside a Form (e.g. the payment dialog)
+  const CodeEntry({
+    super.key,
+    required this.controller,
+    required this.description,
+    required this.onResend,
+    required this.busy,
+    this.validator,
+  });
+
+  @override
+  State<CodeEntry> createState() => _CodeEntryState();
+}
+
+class _CodeEntryState extends State<CodeEntry> {
+  static const _codeLifetime = Duration(minutes: 10);
+  var _expiresAt = DateTime.now().add(_codeLifetime);
+  Timer? _ticker;
+  bool _resending = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() {}); // just to re-render the countdown text
+    });
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _resend() async {
+    setState(() => _resending = true);
+    try {
+      await widget.onResend();
+      if (!mounted) return;
+      setState(() => _expiresAt = DateTime.now().add(_codeLifetime));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Code resent.')));
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    } finally {
+      if (mounted) setState(() => _resending = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final remaining = _expiresAt.difference(DateTime.now());
+    final expired = remaining.isNegative;
+    final mm = remaining.inMinutes.clamp(0, 99);
+    final ss = (remaining.inSeconds % 60).clamp(0, 59).toString().padLeft(2, '0');
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+      Text(widget.description),
+      const SizedBox(height: 4),
+      Text(
+        expired ? 'Code expired — tap Resend below.' : 'Expires in $mm:$ss',
+        style: TextStyle(fontSize: 12, color: expired ? _warn : Theme.of(context).hintColor),
+      ),
+      const SizedBox(height: 12),
+      TextFormField(
+        controller: widget.controller,
+        autofocus: true,
+        keyboardType: TextInputType.number,
+        decoration: const InputDecoration(labelText: 'Verification code'),
+        validator: widget.validator,
+      ),
+      Align(
+        alignment: Alignment.centerLeft,
+        child: TextButton(
+          onPressed: (widget.busy || _resending) ? null : _resend,
+          child: Text(_resending ? 'Sending...' : 'Resend code'),
+        ),
+      ),
+    ]);
+  }
+}
+
 class Panel extends StatelessWidget {
   final Widget child;
   const Panel({super.key, required this.child});
@@ -144,16 +257,31 @@ Future<void> payNow(BuildContext context, Map<String, dynamic> acct, Future<void
     context: context,
     builder: (c) => AlertDialog(
       title: const Text('Confirm payment'),
-      content: Text("Pay ${peso(amount)} for your ${acct['plan']['name']} plan? "
-          "We'll send a code first to confirm it's you."),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel')),
-        OutlinedButton(onPressed: () => Navigator.pop(c, 'sms'), child: const Text('Verify by SMS')),
-        FilledButton(onPressed: () => Navigator.pop(c, 'email'), child: const Text('Verify by email')),
-      ],
+      content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+        Text("Pay ${peso(amount)} for your ${acct['plan']['name']} plan? "
+            "We'll send a code first to confirm it's you."),
+        const SizedBox(height: 16),
+        // Equal weight on purpose: neither channel is a "default", so neither gets the filled/primary look.
+        OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+          onPressed: () => Navigator.pop(c, 'sms'),
+          icon: const Icon(Icons.sms_outlined),
+          label: const Text('Verify by SMS'),
+        ),
+        const SizedBox(height: 8),
+        OutlinedButton.icon(
+          style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
+          onPressed: () => Navigator.pop(c, 'email'),
+          icon: const Icon(Icons.email_outlined),
+          label: const Text('Verify by email'),
+        ),
+      ]),
+      actions: [TextButton(onPressed: () => Navigator.pop(c), child: const Text('Cancel'))],
     ),
   );
   if (channel == null) return;
+  // The dialog above awaited user input; confirm we're still on-screen before touching context again.
+  if (!context.mounted) return;
 
   // Shared by both paths below: once a payment has actually been started (whether that took a
   // verification code first or not), opening the checkout / dev-mode handling is identical.
@@ -177,25 +305,26 @@ Future<void> payNow(BuildContext context, Map<String, dynamic> acct, Future<void
     messenger.showSnackBar(const SnackBar(content: Text('Payment received. Thank you!')));
   }
 
-  // Shows a brief, non-dismissible spinner while a code is being sent or checked, so there's visible
-  // feedback during that gap instead of the screen looking like it just froze after picking a channel.
-  Future<T> withSpinner<T>(Future<T> Function() request) async {
-    showDialog<void>(context: context, barrierDismissible: false, builder: (_) => const Center(child: CircularProgressIndicator()));
-    try {
-      return await request();
-    } finally {
-      if (context.mounted) Navigator.of(context, rootNavigator: true).pop();
-    }
-  }
-
   try {
-    final started = await withSpinner(() => api.startPayment(acct['id'] as int, amount, channel));
+    final started = await _withLabeledSpinner(
+      context,
+      label: channel == 'sms' ? 'Sending code by SMS...' : 'Sending code by email...',
+      request: () => api.startPayment(acct['id'] as int, amount, channel),
+    );
     if (started == null) {
-      // A verification code was sent instead of starting the payment directly.
+      // A verification code was sent instead of starting the payment directly. The dialog confirms the
+      // code itself — retrying inline on a wrong one, same as login/link-account do — and pops with the
+      // finished payment info once the server accepts it, or null if the user cancels out of it.
       if (!context.mounted) return;
-      final code = await showDialog<String>(context: context, builder: (_) => _PaymentCodeDialog(channel: channel));
-      if (code == null) return;
-      final confirmed = await withSpinner(() => api.confirmPayment(acct['id'] as int, code));
+      final confirmed = await showDialog<Map<String, dynamic>>(
+        context: context,
+        builder: (_) => _PaymentCodeDialog(
+          accountId: acct['id'] as int,
+          channel: channel,
+          onResend: () => api.startPayment(acct['id'] as int, amount, channel),
+        ),
+      );
+      if (confirmed == null) return;
       await openOrSimulate(confirmed);
       return;
     }
@@ -205,9 +334,33 @@ Future<void> payNow(BuildContext context, Map<String, dynamic> acct, Future<void
   }
 }
 
+/// A brief, non-dismissible, labeled spinner. Used for the one gap in the payment flow that's still
+/// silent otherwise — picking a channel and waiting for the first code to actually send — since that
+/// happens between two dialogs, with no screen underneath to show a "Please wait..." button label on.
+Future<T> _withLabeledSpinner<T>(BuildContext context, {required String label, required Future<T> Function() request}) async {
+  showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => AlertDialog(
+      content: Row(mainAxisSize: MainAxisSize.min, children: [
+        const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2.5)),
+        const SizedBox(width: 16),
+        Text(label),
+      ]),
+    ),
+  );
+  try {
+    return await request();
+  } finally {
+    if (context.mounted) Navigator.of(context, rootNavigator: true).pop();
+  }
+}
+
 class _PaymentCodeDialog extends StatefulWidget {
+  final int accountId;
   final String channel;
-  const _PaymentCodeDialog({required this.channel});
+  final Future<void> Function() onResend;
+  const _PaymentCodeDialog({required this.accountId, required this.channel, required this.onResend});
 
   @override
   State<_PaymentCodeDialog> createState() => _PaymentCodeDialogState();
@@ -215,23 +368,47 @@ class _PaymentCodeDialog extends StatefulWidget {
 
 class _PaymentCodeDialogState extends State<_PaymentCodeDialog> {
   final _code = TextEditingController();
+  bool _busy = false;
+  String? _error;
+
+  Future<void> _confirm() async {
+    if (_code.text.trim().isEmpty) {
+      setState(() => _error = 'Enter the code you were sent');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final info = await api.confirmPayment(widget.accountId, _code.text.trim());
+      if (mounted) Navigator.pop(context, info);
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) => AlertDialog(
         title: const Text('Enter the code'),
-        content: Column(mainAxisSize: MainAxisSize.min, children: [
-          Text('We sent a code by ${widget.channel == 'sms' ? 'SMS' : 'email'}.'),
-          const SizedBox(height: 12),
-          TextField(
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          CodeEntry(
             controller: _code,
-            autofocus: true,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(labelText: 'Verification code'),
+            description: 'We sent a code by ${widget.channel == 'sms' ? 'SMS' : 'email'}.',
+            busy: _busy,
+            onResend: widget.onResend,
           ),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 12),
+              child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318))),
+            ),
         ]),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-          FilledButton(onPressed: () => Navigator.pop(context, _code.text.trim()), child: const Text('Confirm')),
+          TextButton(onPressed: _busy ? null : () => Navigator.pop(context), child: const Text('Cancel')),
+          FilledButton(onPressed: _busy ? null : _confirm, child: Text(_busy ? 'Checking...' : 'Confirm')),
         ],
       );
 }
@@ -404,6 +581,15 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _verifying = false; // true once the server asked for an email code; same form, second step
   String? _error;
 
+  @override
+  void initState() {
+    super.initState();
+    // Only this screen needs Google Sign-In, so it's initialized here rather than in main() — nothing
+    // else in the app touches it. A problem here (e.g. a misconfigured client ID) surfaces when the
+    // button is actually tapped, via the try/catch in _signInWithGoogle, rather than crashing startup.
+    unawaited(GoogleSignIn.instance.initialize(serverClientId: googleServerClientId));
+  }
+
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
     setState(() {
@@ -422,6 +608,30 @@ class _LoginScreenState extends State<LoginScreen> {
       }
       if (!mounted) return;
       Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const Shell()));
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _signInWithGoogle() async {
+    if (!GoogleSignIn.instance.supportsAuthenticate()) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final account = await GoogleSignIn.instance.authenticate();
+      final idToken = account.authentication.idToken;
+      if (idToken == null) throw ApiException("Google didn't return a usable sign-in token.");
+      await api.loginWithGoogle(idToken);
+      if (!mounted) return;
+      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const Shell()));
+    } on GoogleSignInException catch (e) {
+      // The user backing out of the Google account picker isn't an error worth showing.
+      if (e.code == GoogleSignInExceptionCode.canceled) return;
+      if (mounted) setState(() => _error = e.description ?? 'Google sign-in failed (${e.code}).');
     } catch (e) {
       if (mounted) setState(() => _error = '$e');
     } finally {
@@ -477,16 +687,34 @@ class _LoginScreenState extends State<LoginScreen> {
                           return null;
                         },
                       ),
-                    ] else ...[
-                      Text('We sent a code to ${_email.text.trim()}.'),
                       const SizedBox(height: 20),
-                      TextFormField(
+                      Row(children: [
+                        const Expanded(child: Divider()),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: Text('or', style: TextStyle(color: Theme.of(context).hintColor)),
+                        ),
+                        const Expanded(child: Divider()),
+                      ]),
+                      const SizedBox(height: 20),
+                      OutlinedButton(
+                        onPressed: _busy ? null : _signInWithGoogle,
+                        style: OutlinedButton.styleFrom(
+                          minimumSize: const Size.fromHeight(52),
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        ),
+                        child: const Text('Continue with Google'),
+                      ),
+                    ] else ...[
+                      stepTwoDots(context),
+                      CodeEntry(
                         controller: _code,
-                        keyboardType: TextInputType.number,
-                        decoration: const InputDecoration(labelText: 'Verification code'),
+                        description: 'We sent a code to ${_email.text.trim()}.',
+                        busy: _busy,
+                        onResend: () => api.login(_email.text.trim(), _password.text, register: _register),
                         validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the code you were sent' : null,
                       ),
-                      const SizedBox(height: 8),
+                      const SizedBox(height: 4),
                       TextButton(
                         onPressed: _busy ? null : () => setState(() => _verifying = false),
                         child: const Text('Use a different email'),
@@ -587,15 +815,15 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
                 validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the registered mobile number' : null,
               ),
             ] else ...[
-              Text('We sent a code by SMS to ${_mobile.text.trim()}.'),
-              const SizedBox(height: 20),
-              TextFormField(
+              stepTwoDots(context),
+              CodeEntry(
                 controller: _code,
-                keyboardType: TextInputType.number,
-                decoration: const InputDecoration(labelText: 'SMS code'),
+                description: 'We sent a code by SMS to ${_mobile.text.trim()}.',
+                busy: _busy,
+                onResend: () => api.startLinkAccount(_no.text.trim(), _mobile.text.trim()),
                 validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the code you were sent' : null,
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 4),
               TextButton(
                 onPressed: _busy ? null : () => setState(() => _otpSent = false),
                 child: const Text('Use a different number'),

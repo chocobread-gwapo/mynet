@@ -22,6 +22,8 @@ from pathlib import Path
 import httpx
 import jwt
 from dotenv import load_dotenv
+from google.auth.transport import requests as google_auth_transport
+from google.oauth2 import id_token as google_id_token
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
@@ -103,6 +105,14 @@ SMTP_PASSWORD = config_value("SMTP_PASSWORD")
 SMTP_HOST = config_value("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(config_value("SMTP_PORT", "587"))
 
+# Leave unset to keep "Sign in with Google" disabled server-side (the app's button will show an error
+# if tapped). Set it to the Web OAuth client ID from Google Cloud Console (APIs & Services >
+# Credentials) — the SAME value the Flutter app uses as its serverClientId. This has to be the Web
+# client, not the Android one: Google signs the token for whichever client requested it, and the
+# Android google_sign_in setup is built around requesting it for the paired web client, so the ID
+# token's audience always comes back as the web client's ID.
+GOOGLE_CLIENT_ID = config_value("GOOGLE_CLIENT_ID")
+
 engine = create_engine(f"sqlite:///{(_BASE_DIR / 'app.db').as_posix()}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 
@@ -116,8 +126,13 @@ class User(Base):
     __tablename__ = "users"
     id: Mapped[int] = mapped_column(primary_key=True)
     email: Mapped[str] = mapped_column(String, unique=True)
-    password_hash: Mapped[str]
+    # Optional now: a user created through Google sign-in has no password at all (nothing to check
+    # against), rather than a hash of some random value nobody will ever type.
+    password_hash: Mapped[str | None] = mapped_column(default=None)
     email_verified: Mapped[bool] = mapped_column(default=False)
+    # Google's stable per-account ID ("sub" in the ID token) for a user who has ever signed in with
+    # Google. Deliberately not the email: a Google account's email can change, sub never does.
+    google_sub: Mapped[str | None] = mapped_column(String, unique=True, default=None)
 
 
 class Plan(Base):
@@ -410,7 +425,9 @@ def login(body: Credentials, db: Session = Depends(get_db)):
     email = body.email.strip().lower()
     rate_limit(f"login:{email}")
     user = db.scalar(select(User).where(User.email == email))
-    if not user or not check_pw(body.password, user.password_hash):
+    # A Google-only account has no password_hash to check against — same error either way, so this
+    # doesn't leak whether the account exists at all, let alone how it was created.
+    if not user or not user.password_hash or not check_pw(body.password, user.password_hash):
         raise HTTPException(401, "Wrong email or password")
     if SMTP_USERNAME and not user.email_verified:
         _send_email_code(email)  # also doubles as "resend" if they never finished verifying
@@ -429,6 +446,48 @@ def verify_email(body: EmailVerifyBody, db: Session = Depends(get_db)):
         raise HTTPException(401, "Incorrect or expired code")
     user.email_verified = True
     db.commit()
+    return {"token": make_token(user.id)}
+
+
+class GoogleSignInBody(BaseModel):
+    id_token: str
+
+
+@app.post("/api/v1/auth/google", status_code=201)
+def google_sign_in(body: GoogleSignInBody, db: Session = Depends(get_db)):
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(400, "Google sign-in isn't configured on this server")
+
+    # verify_oauth2_token checks the signature against Google's own public keys, the expiry, the
+    # issuer, and (since we pass GOOGLE_CLIENT_ID as the audience) that the token was actually issued
+    # for this app and not some other one. Catching broadly and surfacing the message beats guessing
+    # which of the library's several exception types a given bad token will raise.
+    try:
+        info = google_id_token.verify_oauth2_token(
+            body.id_token, google_auth_transport.Request(), GOOGLE_CLIENT_ID
+        )
+    except Exception as e:
+        raise HTTPException(401, f"Invalid Google sign-in token: {e}")
+
+    if not info.get("email_verified", True):
+        raise HTTPException(401, "Google reports this email isn't verified")
+    email = info["email"].strip().lower()
+    google_sub = info["sub"]
+
+    user = db.scalar(select(User).where(User.google_sub == google_sub))
+    if not user:
+        # First time this Google identity has signed in here. If the email already has a
+        # password-based account, link Google to it rather than creating a duplicate; otherwise
+        # create a fresh account. Either way, trust the email as verified — Google already checked it,
+        # so there's no need to send our own code to an address we know is real.
+        user = db.scalar(select(User).where(User.email == email))
+        if user:
+            user.google_sub = google_sub
+            user.email_verified = True
+        else:
+            user = User(email=email, email_verified=True, google_sub=google_sub)
+            db.add(user)
+        db.commit()
     return {"token": make_token(user.id)}
 
 
@@ -930,8 +989,12 @@ def unsubscribe_addon(addon_id: int, a: Account = Depends(my_account), db: Sessi
 
 if __name__ == "__main__":
     # Lets VS Code's Run/F5 button start the server directly — equivalent to running
-    # ` main:appuvicorn --reload` by hand. Only runs when this file is executed directly,
+    # `uvicorn main:app --reload` by hand. Only runs when this file is executed directly,
     # never when something else imports it (e.g. the test suite), so nothing else changes.
     import uvicorn
 
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    # 0.0.0.0 (not 127.0.0.1) so the API also accepts connections from other devices on the
+    # same Wi-Fi, like a real phone during a real-device run — 127.0.0.1 only ever accepts
+    # connections from this same PC, which is fine for the emulator (it tunnels 10.0.2.2 back
+    # to the PC's own loopback) but not for anything actually out on the network.
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
