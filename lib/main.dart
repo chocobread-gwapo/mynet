@@ -687,24 +687,6 @@ class _LoginScreenState extends State<LoginScreen> {
                           return null;
                         },
                       ),
-                      const SizedBox(height: 20),
-                      Row(children: [
-                        const Expanded(child: Divider()),
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          child: Text('or', style: TextStyle(color: Theme.of(context).hintColor)),
-                        ),
-                        const Expanded(child: Divider()),
-                      ]),
-                      const SizedBox(height: 20),
-                      OutlinedButton(
-                        onPressed: _busy ? null : _signInWithGoogle,
-                        style: OutlinedButton.styleFrom(
-                          minimumSize: const Size.fromHeight(52),
-                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                        ),
-                        child: const Text('Continue with Google'),
-                      ),
                     ] else ...[
                       stepTwoDots(context),
                       CodeEntry(
@@ -733,11 +715,46 @@ class _LoginScreenState extends State<LoginScreen> {
                           ? 'Please wait...'
                           : (_verifying ? 'Confirm code' : (_register ? 'Create account' : 'Sign in'))),
                     ),
-                    if (!_verifying)
+                    if (!_verifying) ...[
+                      const SizedBox(height: 20),
+                      Row(children: [
+                        const Expanded(child: Divider()),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          child: Text('or', style: TextStyle(color: Theme.of(context).hintColor)),
+                        ),
+                        const Expanded(child: Divider()),
+                      ]),
+                      const SizedBox(height: 20),
+                      // Google's official circular icon button (from their branding asset pack): the dark
+                      // version on dark theme, the light one on light theme. It carries its own circle and border.
+                      Center(
+                        child: Semantics(
+                          button: true,
+                          label: 'Continue with Google',
+                          child: InkResponse(
+                            onTap: _busy ? null : _signInWithGoogle,
+                            radius: 32,
+                            child: Opacity(
+                              opacity: _busy ? 0.5 : 1,
+                              child: Image.asset(
+                                Theme.of(context).brightness == Brightness.dark
+                                    ? 'assets/google_g_dark.png'
+                                    : 'assets/google_g_light.png',
+                                width: 48,
+                                height: 48,
+                                filterQuality: FilterQuality.high,
+                                errorBuilder: (_, _, _) => const Icon(Icons.login),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
                       TextButton(
                         onPressed: () => setState(() => _register = !_register),
                         child: Text(_register ? 'I already have an account' : 'Create an account'),
                       ),
+                    ],
                   ]),
                 ),
               ),
