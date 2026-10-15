@@ -52,6 +52,20 @@ dev_dependencies:
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
+  flutter_native_splash: ^2.4.6
+
+# Generated into android/ by:  dart run flutter_native_splash:create
+# (the colors match _launchLight/_launchDark in main.dart so the hand-off to the animated splash is seamless)
+flutter_native_splash:
+  color: "#F5FBFA"
+  color_dark: "#001515"
+  image: assets/splash_mark.png
+  android_12:
+    color: "#F5FBFA"
+    color_dark: "#001515"
+    image: assets/splash_mark_android12.png
+  ios: false
+  web: false
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -67,6 +81,8 @@ flutter:
   assets:
     - assets/google_g_dark.png
     - assets/google_g_light.png
+    - assets/splash_mark.png
+    - assets/splash_rings.png
 
   # To add assets to your application, add an assets section, like this:
   # assets:

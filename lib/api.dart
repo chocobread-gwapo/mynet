@@ -115,13 +115,34 @@ class Api {
     return jsonDecode(utf8.decode(res.bodyBytes));
   }
 
-  /// Logs in or registers. Returns true if an email code was sent and must be confirmed with
+  /// Logs in. Returns true if an email code was sent and must be confirmed with
   /// [confirmEmailVerification]; false if a token came back directly (already verified, or dev mode —
   /// no email provider configured on the server yet).
   /// [remember] false keeps the resulting login in memory only (see [_saveToken]).
-  Future<bool> login(String email, String password, {bool register = false, bool remember = false}) async {
-    final d = await _send('POST', register ? '/auth/register' : '/auth/login',
-        body: {'email': email, 'password': password}) as Map;
+  Future<bool> login(String email, String password, {bool remember = false}) async {
+    final d = await _send('POST', '/auth/login', body: {'email': email, 'password': password}) as Map;
+    if (d['verification_required'] == true) return true;
+    await _saveToken(d['token'] as String, persist: remember);
+    return false;
+  }
+
+  /// Creates an account from the registration form. Same return value as [login].
+  Future<bool> register({
+    required String email,
+    required String password,
+    required String firstName,
+    required String lastName,
+    required String mobile,
+    bool remember = false,
+  }) async {
+    final d = await _send('POST', '/auth/register', body: {
+      'email': email,
+      'password': password,
+      'first_name': firstName,
+      'last_name': lastName,
+      'mobile': mobile,
+      'accepted_terms': true, // the form won't submit until both boxes are ticked
+    }) as Map;
     if (d['verification_required'] == true) return true;
     await _saveToken(d['token'] as String, persist: remember);
     return false;
@@ -196,17 +217,18 @@ class Api {
 
   Future<List<dynamic>> accounts() async => (await _send('GET', '/accounts')) as List<dynamic>;
 
-  /// Starts linking an account. Returns true if an SMS code was sent and must be confirmed with
-  /// [confirmLinkAccount]; false if the account was linked immediately (dev mode — no SMS provider
-  /// configured on the server yet).
-  Future<bool> startLinkAccount(String accountNo, String mobile) async {
-    final d = await _send('POST', '/accounts/link/start', body: {'account_no': accountNo, 'mobile': mobile});
-    return (d as Map)['otp_required'] as bool;
+  /// Files a request to link an account. Someone approves it by hand, so nothing is linked yet: the
+  /// account shows up once it's approved. Throws if the number isn't found or is already linked.
+  Future<void> requestLink(String accountNo) async {
+    await _send('POST', '/accounts/link/request', body: {'account_no': accountNo});
   }
 
-  Future<void> confirmLinkAccount(String accountNo, String mobile, String code) async {
-    await _send('POST', '/accounts/link/confirm',
-        body: {'account_no': accountNo, 'mobile': mobile, 'code': code});
+  /// This login's link requests that are waiting (PENDING) or were declined (REJECTED).
+  Future<List<dynamic>> linkRequests() async => (await _send('GET', '/accounts/link/requests')) as List<dynamic>;
+
+  /// Clears a declined request's note after it's been seen.
+  Future<void> dismissLinkRequest(int id) async {
+    await _send('POST', '/accounts/link/requests/$id/dismiss');
   }
 
   /// Removes an account from this login. Asks for the password like every other change to the user's details.
@@ -237,18 +259,19 @@ class Api {
   Future<List<dynamic>> accountAddons(int accountId) async =>
       (await _send('GET', '/accounts/$accountId/addons')) as List<dynamic>;
 
-  Future<void> subscribeAddon(int accountId, int addonId) async {
-    await _send('POST', '/accounts/$accountId/addons', body: {'addon_id': addonId});
+  Future<void> subscribeAddon(int accountId, int addonId, String currentPassword) async {
+    await _send('POST', '/accounts/$accountId/addons',
+        body: {'addon_id': addonId, 'current_password': currentPassword});
   }
 
-  Future<void> unsubscribeAddon(int accountId, int addonId) async {
-    await _send('DELETE', '/accounts/$accountId/addons/$addonId');
+  Future<void> unsubscribeAddon(int accountId, int addonId, String currentPassword) async {
+    await _send('POST', '/accounts/$accountId/addons/$addonId/remove', body: {'current_password': currentPassword});
   }
 
   Future<List<dynamic>> plans() async => (await _send('GET', '/plans')) as List<dynamic>;
 
-  Future<void> upgrade(int id, int planId) async {
-    await _send('POST', '/accounts/$id/upgrade', body: {'plan_id': planId});
+  Future<void> upgrade(int id, int planId, String currentPassword) async {
+    await _send('POST', '/accounts/$id/upgrade', body: {'plan_id': planId, 'current_password': currentPassword});
   }
 
   /// Starts a payment. Returns payment_id/checkout_url/real directly if no code was needed (dev mode —

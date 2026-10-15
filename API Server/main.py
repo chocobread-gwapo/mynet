@@ -94,7 +94,7 @@ PAYMONGO_WEBHOOK_SECRET = config_value("PAYMONGO_WEBHOOK_SECRET")
 # then generate an API key on the dashboard.
 TEXTBEE_API_KEY = config_value("TEXTBEE_API_KEY")
 TEXTBEE_SEND_URL = "https://api.textbee.dev/api/v1/gateway/send-sms"
-OTP_TTL_SECONDS = 600  # textbee doesn't track an expiry itself, so this server enforces its own (10 min)
+OTP_TTL_SECONDS = 180  # textbee doesn't track an expiry itself, so this server enforces its own (3 min)
 
 # Leave SMTP_USERNAME unset to keep registering/logging in without email verification (today's
 # behavior). Set SMTP_USERNAME + SMTP_PASSWORD to require it. Easiest option: a Gmail address with an
@@ -133,6 +133,10 @@ class User(Base):
     # Google's stable per-account ID ("sub" in the ID token) for a user who has ever signed in with
     # Google. Deliberately not the email: a Google account's email can change, sub never does.
     google_sub: Mapped[str | None] = mapped_column(String, unique=True, default=None)
+    # Collected on the registration form (absent for older users and for Google sign-ups).
+    first_name: Mapped[str | None] = mapped_column(String, default=None)
+    last_name: Mapped[str | None] = mapped_column(String, default=None)
+    mobile: Mapped[str | None] = mapped_column(String, default=None)
 
 
 class Plan(Base):
@@ -160,6 +164,15 @@ class Link(Base):  # which user may see which account
     __tablename__ = "links"
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), primary_key=True)
+
+
+class LinkRequest(Base):  # a user asking to be linked to an account; approved by hand
+    __tablename__ = "link_requests"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    status: Mapped[str] = mapped_column(default="PENDING")  # PENDING | APPROVED | REJECTED
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
 
 
 class Bill(Base):
@@ -235,6 +248,12 @@ def rate_limit(key: str, max_attempts: int = 5, window_seconds: int = 60) -> Non
 def seed() -> None:
     """Create tables and two fake demo accounts (no real customer data)."""
     Base.metadata.create_all(engine)
+    # create_all never alters an existing table, so add the registration columns to an older database.
+    with engine.begin() as conn:
+        have = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(users)")}
+        for col in ("first_name", "last_name", "mobile"):
+            if col not in have:
+                conn.exec_driver_sql(f"ALTER TABLE users ADD COLUMN {col} VARCHAR")
     with SessionLocal() as db:
         if not db.scalar(select(AddOn)):  # separate check: added after Plan seeding already existed for some installs
             db.add_all([
@@ -363,6 +382,21 @@ class Credentials(BaseModel):
     password: str
 
 
+class RegisterBody(Credentials):
+    first_name: str
+    last_name: str
+    mobile: str
+    accepted_terms: bool = False
+
+
+def _password_problem(pw: str) -> str | None:
+    """The rule for a NEW password (registration, reset, change). Logging in doesn't use it, so people
+    who signed up under the old 8-character rule can still sign in."""
+    if len(pw) < 8 or not any(c.isupper() for c in pw) or not any(c.isdigit() for c in pw):
+        return "Password must be 8 characters or more with an uppercase character and a number"
+    return None
+
+
 class EmailVerifyBody(BaseModel):
     email: str
     code: str
@@ -381,7 +415,7 @@ def _deliver_email_code(email: str, code: str, subject: str = "Your NetPulse ver
     msg["Subject"] = subject
     msg["From"] = SMTP_USERNAME
     msg["To"] = email
-    msg.set_content(message or f"Your NetPulse verification code is {code}. It expires in 10 minutes.")
+    msg.set_content(message or f"Your NetPulse verification code is {code}. It expires in 3 minutes.")
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
             server.starttls()
@@ -417,13 +451,25 @@ def _check_pending_email_otp(email: str, code: str) -> bool:
 
 
 @app.post("/api/v1/auth/register", status_code=201)
-def register(body: Credentials, db: Session = Depends(get_db)):
+def register(body: RegisterBody, db: Session = Depends(get_db)):
     email = body.email.strip().lower()
-    if "@" not in email or len(body.password) < 8:
-        raise HTTPException(422, "Enter a valid email and a password of at least 8 characters")
+    if "@" not in email:
+        raise HTTPException(422, "Enter a valid email")
+    problem = _password_problem(body.password)
+    if problem:
+        raise HTTPException(422, problem)
+    first, last = body.first_name.strip(), body.last_name.strip()
+    if not first or not last:
+        raise HTTPException(422, "Enter your first and last name")
+    mobile = _normalize_mobile(body.mobile)
+    if not mobile:
+        raise HTTPException(422, "Enter a valid mobile number")
+    if not body.accepted_terms:
+        raise HTTPException(422, "Please accept the Privacy Policy and the Terms & Conditions")
     if db.scalar(select(User).where(User.email == email)):
         raise HTTPException(409, "Email already registered")
-    user = User(email=email, password_hash=hash_pw(body.password), email_verified=not SMTP_USERNAME)
+    user = User(email=email, password_hash=hash_pw(body.password), email_verified=not SMTP_USERNAME,
+                first_name=first, last_name=last, mobile=mobile)
     db.add(user)
     db.commit()
     if not SMTP_USERNAME:
@@ -499,7 +545,7 @@ def _send_reset_email(email: str, code: str) -> None:
         _deliver_email_code(
             email, code,
             subject="Reset your NetPulse password",
-            message=f"Your NetPulse password reset code is {code}. It expires in 10 minutes.\n\n"
+            message=f"Your NetPulse password reset code is {code}. It expires in 3 minutes.\n\n"
                     "If you didn't ask to reset your password, you can ignore this email.",
         )
     except HTTPException as e:
@@ -587,8 +633,9 @@ def _notify_password_changed(background: BackgroundTasks, db: Session, user: Use
 def reset_password(body: ResetPasswordBody, background: BackgroundTasks, db: Session = Depends(get_db)):
     email = body.email.strip().lower()
     rate_limit(f"reset:{email}")
-    if len(body.new_password) < 8:
-        raise HTTPException(422, "Password must be at least 8 characters")
+    problem = _password_problem(body.new_password)
+    if problem:
+        raise HTTPException(422, problem)
     user = db.scalar(select(User).where(User.email == email))
     # An unknown email never has a pending code, so it fails exactly like a wrong or expired one.
     if not user or not _check_pending_reset_otp(email, body.code.strip()):
@@ -646,15 +693,6 @@ def google_sign_in(body: GoogleSignInBody, db: Session = Depends(get_db)):
 
 
 # ---------- accounts ----------
-class LinkBody(BaseModel):
-    account_no: str
-    mobile: str  # must match the number on file; see /accounts/link/confirm for the SMS code step
-
-
-class LinkConfirmBody(BaseModel):
-    account_no: str
-    mobile: str
-    code: str
 
 
 # textbee is a plain "send this text" API — no OTP concept of its own, so this server generates the code
@@ -682,7 +720,7 @@ async def _deliver_sms_code(mobile: str, code: str, message: str | None = None) 
     ever run more than one."""
     payload = {
         "recipients": [_to_e164(mobile)],
-        "message": message or f"Your NetPulse verification code is {code}. It expires in 10 minutes.",
+        "message": message or f"Your NetPulse verification code is {code}. It expires in 3 minutes.",
     }
     headers = {"x-api-key": TEXTBEE_API_KEY}
     async with httpx.AsyncClient(timeout=15) as client:
@@ -732,33 +770,103 @@ def _complete_link(db: Session, user: User, acct: Account) -> dict:
     return account_view(acct, db)
 
 
-@app.post("/api/v1/accounts/link/start", status_code=201)
-async def start_link(body: LinkBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    rate_limit(f"link:{body.account_no}")
-    acct = _matching_account(db, body.account_no, body.mobile)
-
-    if not TEXTBEE_API_KEY:
-        # Dev-mode fallback: no SMS gateway configured yet, so link immediately like before.
-        return {"otp_required": False, **_complete_link(db, user, acct)}
-
-    try:
-        await _textbee_send_code(body.account_no, body.mobile)
-    except httpx.HTTPError as e:
-        raise HTTPException(502, f"Could not reach the SMS gateway: {e}")
-    return {"otp_required": True}
+class LinkRequestBody(BaseModel):
+    account_no: str
 
 
-@app.post("/api/v1/accounts/link/confirm", status_code=201)
-async def confirm_link(body: LinkConfirmBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    rate_limit(f"link-confirm:{body.account_no}")
-    acct = _matching_account(db, body.account_no, body.mobile)
+@app.post("/api/v1/accounts/link/request", status_code=201)
+def request_link(body: LinkRequestBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Linking is approved by hand: this only files a request, and the account appears once it's approved."""
+    rate_limit(f"link-request:{user.id}")
+    account_no = body.account_no.strip()
+    acct = db.scalar(select(Account).where(Account.account_no == account_no))
+    if not acct:
+        raise HTTPException(404, "We couldn't find that account number. Please check it and try again.")
+    if db.get(Link, (user.id, acct.id)):
+        raise HTTPException(409, "This account is already linked to your login.")
+    # A new request replaces an earlier declined one for the same account, so a stale "declined" note goes away.
+    for old in db.scalars(select(LinkRequest).where(
+            LinkRequest.user_id == user.id, LinkRequest.account_id == acct.id, LinkRequest.status == "REJECTED")):
+        db.delete(old)
+    pending = db.scalar(select(LinkRequest).where(
+        LinkRequest.user_id == user.id, LinkRequest.account_id == acct.id, LinkRequest.status == "PENDING"))
+    if not pending:
+        db.add(LinkRequest(user_id=user.id, account_id=acct.id))
+        db.commit()
+    return {"status": "PENDING"}
 
-    if not TEXTBEE_API_KEY:
-        return _complete_link(db, user, acct)  # nothing to confirm in dev mode
 
-    if not _check_pending_otp(body.account_no, body.code):
-        raise HTTPException(401, "Incorrect or expired code")
-    return _complete_link(db, user, acct)
+@app.get("/api/v1/accounts/link/requests")
+def my_link_requests(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rows = db.execute(select(LinkRequest, Account).join(Account, Account.id == LinkRequest.account_id)
+                      .where(LinkRequest.user_id == user.id, LinkRequest.status.in_(("PENDING", "REJECTED")))
+                      .order_by(LinkRequest.id)).all()
+    return [{"id": r.id, "account_no": a.account_no, "status": r.status, "created_at": r.created_at.isoformat()}
+            for r, a in rows]
+
+
+@app.post("/api/v1/accounts/link/requests/{request_id}/dismiss", status_code=204)
+def dismiss_link_request(request_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Clears a declined request's note once the user has seen it. Pending ones can't be dismissed."""
+    req = db.get(LinkRequest, request_id)
+    if req and req.user_id == user.id and req.status == "REJECTED":
+        db.delete(req)
+        db.commit()
+
+
+# ---------- admin: approving link requests ----------
+def require_admin(request: Request, x_admin_key: str | None = Header(default=None)) -> None:
+    """Whoever runs the service approves link requests. With NETPULSE_ADMIN_KEY set (do this anywhere the
+    server is reachable by others) the X-Admin-Key header must match it; without it, only requests from
+    the server's own machine are allowed, e.g. the http://localhost:8000/docs page while developing."""
+    key = os.getenv("NETPULSE_ADMIN_KEY")
+    if key:
+        if not x_admin_key or not hmac.compare_digest(x_admin_key, key):
+            raise HTTPException(403, "Admin key required")
+    elif not request.client or request.client.host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(403, "Admin routes are only available from the server itself unless NETPULSE_ADMIN_KEY is set")
+
+
+@app.get("/api/v1/admin/link-requests", dependencies=[Depends(require_admin)])
+def admin_list_link_requests(db: Session = Depends(get_db)):
+    rows = db.execute(select(LinkRequest, Account, User).join(Account, Account.id == LinkRequest.account_id)
+                      .join(User, User.id == LinkRequest.user_id)
+                      .where(LinkRequest.status == "PENDING").order_by(LinkRequest.id)).all()
+    return [{"id": r.id, "requested_at": r.created_at.isoformat(), "user_email": u.email,
+             "user_name": f"{u.first_name or ''} {u.last_name or ''}".strip(), "user_mobile": u.mobile,
+             "account_no": a.account_no, "account_holder": a.holder_name, "account_mobile": a.mobile}
+            for r, a, u in rows]
+
+
+def _decide_link_request(request_id: int, approve: bool, background: BackgroundTasks, db: Session) -> dict:
+    req = db.get(LinkRequest, request_id)
+    if not req:
+        raise HTTPException(404, "Request not found")
+    if req.status != "PENDING":
+        raise HTTPException(409, f"Already {req.status.lower()}")
+    user, acct = db.get(User, req.user_id), db.get(Account, req.account_id)
+    if approve:
+        _complete_link(db, user, acct)
+    req.status = "APPROVED" if approve else "REJECTED"
+    db.commit()
+    verdict = "approved" if approve else "declined"
+    _queue_notices(
+        background, label=f"link {verdict}", email=user.email, mobiles=[],
+        subject=f"Your NetPulse link request was {verdict}",
+        email_text=(f"Your request to link account {acct.account_no} to NetPulse was {verdict}."
+                    + (" Open the app to see it." if approve else " If you think this is a mistake, please contact us.")),
+        sms_text="")
+    return {"id": req.id, "status": req.status}
+
+
+@app.post("/api/v1/admin/link-requests/{request_id}/approve", dependencies=[Depends(require_admin)])
+def admin_approve_link(request_id: int, background: BackgroundTasks, db: Session = Depends(get_db)):
+    return _decide_link_request(request_id, True, background, db)
+
+
+@app.post("/api/v1/admin/link-requests/{request_id}/reject", dependencies=[Depends(require_admin)])
+def admin_reject_link(request_id: int, background: BackgroundTasks, db: Session = Depends(get_db)):
+    return _decide_link_request(request_id, False, background, db)
 
 
 @app.get("/api/v1/accounts")
@@ -866,8 +974,9 @@ def change_password(body: ChangePasswordBody, background: BackgroundTasks,
                     user: User = Depends(current_user), db: Session = Depends(get_db)):
     rate_limit(f"me-password:{user.id}")
     _require_password(user, body.current_password)
-    if len(body.new_password) < 8:
-        raise HTTPException(422, "Password must be at least 8 characters")
+    problem = _password_problem(body.new_password)
+    if problem:
+        raise HTTPException(422, problem)
     if body.new_password == body.current_password:
         raise HTTPException(422, "Choose a password that's different from your current one")
     user.password_hash = hash_pw(body.new_password)
@@ -895,7 +1004,7 @@ def start_email_change(body: EmailChangeBody, background: BackgroundTasks,
     if SMTP_USERNAME:
         # Goes to the NEW address, so only someone who can read it can finish the change.
         background.add_task(_send_notice_email, new_email, "Confirm your new NetPulse email address",
-                            f"Your NetPulse code is {code}. It expires in 10 minutes.\n\n"
+                            f"Your NetPulse code is {code}. It expires in 3 minutes.\n\n"
                             "If you didn't ask to change your email address, you can ignore this email.")
     else:
         print(f"[email change] code for {new_email}: {code}")  # dev-mode fallback: no email provider yet
@@ -1163,7 +1272,7 @@ async def confirm_payment(body: PaymentConfirmBody, a: Account = Depends(my_acco
     rate_limit(f"pay-confirm:{a.id}")
     amount = _check_pending_payment_otp(a.id, body.code)
     if amount is None:
-        raise HTTPException(401, "Incorrect or expired code")
+        raise HTTPException(400, "Incorrect or expired code")
     return await _begin_payment(db, a, amount)
 
 
@@ -1267,10 +1376,14 @@ def list_plans(db: Session = Depends(get_db)):
 
 class UpgradeBody(BaseModel):
     plan_id: int
+    current_password: str
 
 
 @app.post("/api/v1/accounts/{account_id}/upgrade")
-def upgrade_plan(body: UpgradeBody, a: Account = Depends(my_account), db: Session = Depends(get_db)):
+def upgrade_plan(body: UpgradeBody, a: Account = Depends(my_account), user: User = Depends(current_user),
+                 db: Session = Depends(get_db)):
+    rate_limit(f"me-plan:{user.id}")
+    _require_password(user, body.current_password)  # a plan switch changes the bill, so it asks like other changes
     if a.balance > 0:  # business rule lives on the server, not just in the app
         raise HTTPException(409, "Please settle your amount due before upgrading")
     plan = db.get(Plan, body.plan_id)
@@ -1336,10 +1449,18 @@ def account_addons(a: Account = Depends(my_account), db: Session = Depends(get_d
 
 class AddOnBody(BaseModel):
     addon_id: int
+    current_password: str
+
+
+class RemoveAddOnBody(BaseModel):
+    current_password: str
 
 
 @app.post("/api/v1/accounts/{account_id}/addons", status_code=201)
-def subscribe_addon(body: AddOnBody, a: Account = Depends(my_account), db: Session = Depends(get_db)):
+def subscribe_addon(body: AddOnBody, a: Account = Depends(my_account), user: User = Depends(current_user),
+                    db: Session = Depends(get_db)):
+    rate_limit(f"me-addon:{user.id}")
+    _require_password(user, body.current_password)
     addon = db.get(AddOn, body.addon_id)
     if not addon:
         raise HTTPException(404, "Add-on not found")
@@ -1351,8 +1472,12 @@ def subscribe_addon(body: AddOnBody, a: Account = Depends(my_account), db: Sessi
     return account_view(a, db)
 
 
-@app.delete("/api/v1/accounts/{account_id}/addons/{addon_id}")
-def unsubscribe_addon(addon_id: int, a: Account = Depends(my_account), db: Session = Depends(get_db)):
+@app.post("/api/v1/accounts/{account_id}/addons/{addon_id}/remove")
+def unsubscribe_addon(addon_id: int, body: RemoveAddOnBody, a: Account = Depends(my_account),
+                      user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Was a body-less DELETE; now a POST so it can carry the password (no password-free route is left)."""
+    rate_limit(f"me-addon:{user.id}")
+    _require_password(user, body.current_password)
     link = db.get(AccountAddOn, (a.id, addon_id))
     if not link:
         raise HTTPException(404, "Add-on not active on this account")

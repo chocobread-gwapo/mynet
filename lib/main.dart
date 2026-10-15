@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:math' as math;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -151,7 +153,7 @@ Widget stepTwoDots(BuildContext context) {
 }
 
 /// Shared "enter the code we sent" block used by login/register (email), account linking (SMS), and
-/// payment confirmation (either). Shows a live 10-minute countdown matching the server's OTP_TTL_SECONDS,
+/// payment confirmation (either). Shows a live 3-minute countdown matching the server's OTP_TTL_SECONDS,
 /// and a resend link — calling [onResend] re-sends a fresh code through the same endpoint that sent the
 /// first one, which is all a "resend" is server-side (see confirm_payment/confirm_link/login's comments).
 class CodeEntry extends StatefulWidget {
@@ -174,7 +176,7 @@ class CodeEntry extends StatefulWidget {
 }
 
 class _CodeEntryState extends State<CodeEntry> {
-  static const _codeLifetime = Duration(minutes: 10);
+  static const _codeLifetime = Duration(minutes: 3);
   var _expiresAt = DateTime.now().add(_codeLifetime);
   Timer? _ticker;
   bool _resending = false;
@@ -223,6 +225,7 @@ class _CodeEntryState extends State<CodeEntry> {
       const SizedBox(height: 12),
       TextFormField(
         controller: widget.controller,
+        autofillHints: const [AutofillHints.oneTimeCode],
         autofocus: true,
         keyboardType: TextInputType.number,
         decoration: const InputDecoration(labelText: 'Verification code'),
@@ -572,6 +575,12 @@ class App extends StatelessWidget {
 }
 
 /// Shown briefly at startup: tries a saved token before falling back to the login screen.
+/// The splash's green, and the phone's launch-screen colors (the same as the app's dark and light
+/// backgrounds). Keep the launch colors equal to `color` / `color_dark` in pubspec.yaml's flutter_native_splash.
+const _splashColor = Color(0xFF0F8F82);
+const _launchLight = Color(0xFFF5FBFA);
+const _launchDark = Color(0xFF001515);
+
 class AuthGate extends StatefulWidget {
   const AuthGate({super.key});
   @override
@@ -579,6 +588,9 @@ class AuthGate extends StatefulWidget {
 }
 
 class _AuthGateState extends State<AuthGate> {
+  // The splash stays up at least this long, so the pulse is actually seen even when the check is instant.
+  final Future<void> _minShow = Future<void>.delayed(const Duration(milliseconds: 2200));
+
   @override
   void initState() {
     super.initState();
@@ -600,13 +612,140 @@ class _AuthGateState extends State<AuthGate> {
     }
   }
 
-  void _goTo(Widget page) {
+  Future<void> _goTo(Widget page) async {
+    await _minShow;
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => page));
+    // Fades out of the green splash instead of sliding, so the change of screen is gentle.
+    Navigator.of(context).pushReplacement(PageRouteBuilder(
+      transitionDuration: const Duration(milliseconds: 450),
+      pageBuilder: (_, _, _) => page,
+      transitionsBuilder: (_, animation, _, child) => FadeTransition(opacity: animation, child: child),
+    ));
   }
 
   @override
-  Widget build(BuildContext context) => const Scaffold(body: Center(child: CircularProgressIndicator()));
+  Widget build(BuildContext context) => Scaffold(
+        // Starts as exactly the phone's own launch screen (see flutter_native_splash in pubspec.yaml), so
+        // opening the app goes from the launch screen to this one without a visible change; the green then
+        // spreads out from the logo.
+        backgroundColor: Theme.of(context).brightness == Brightness.dark ? _launchDark : _launchLight,
+        body: const SizedBox.expand(child: PulseSplash()),
+      );
+}
+
+/// The startup splash. It begins exactly like the launch screen (the logo on the app's background), then
+/// green spreads out from the logo's center until it fills the screen; the logo turns into white rings that
+/// beat like a heartbeat with ripples spreading out of them.
+class PulseSplash extends StatefulWidget {
+  const PulseSplash({super.key});
+  @override
+  State<PulseSplash> createState() => _PulseSplashState();
+}
+
+class _PulseSplashState extends State<PulseSplash> with TickerProviderStateMixin {
+  late final AnimationController _reveal =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 1200))..forward();
+  late final AnimationController _c = AnimationController(vsync: this, duration: const Duration(milliseconds: 1800))
+    ..repeat();
+
+  @override
+  void dispose() {
+    _reveal.dispose();
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: Listenable.merge([_reveal, _c]),
+      builder: (context, _) {
+        // 0..1: a short hold on the launch-screen look, then the green spreads.
+        final spread = Curves.easeInOutCubic.transform(((_reveal.value - 0.2) / 0.8).clamp(0.0, 1.0));
+        final squareOpacity = 1 - (spread * 2).clamp(0.0, 1.0);
+        final ringsOpacity = ((spread - 0.3) / 0.5).clamp(0.0, 1.0);
+        final intro = ((spread - 0.65) / 0.35).clamp(0.0, 1.0); // ripples and the name come in last
+        // A quick double-beat once per cycle, then rest. Only once the green is mostly there.
+        final beat = intro * math.pow(math.sin(math.pi * _c.value * 2).abs(), 10).toDouble();
+        return Stack(fit: StackFit.expand, children: [
+          CustomPaint(painter: _RevealPainter(spread)),
+          // A Stack, so the logo sits at the exact center of the screen (where the launch screen draws it)
+          // and the name hangs below it without pushing it up.
+          Center(
+            child: SizedBox(
+              width: 240,
+              height: 240,
+              child: Stack(alignment: Alignment.center, clipBehavior: Clip.none, children: [
+                Positioned.fill(child: CustomPaint(painter: _RipplePainter(_c.value, intro))),
+                Opacity(
+                  opacity: squareOpacity,
+                  child: Image.asset('assets/splash_mark.png', width: 84, height: 84, filterQuality: FilterQuality.high),
+                ),
+                Opacity(
+                  opacity: ringsOpacity,
+                  child: Transform.scale(
+                    scale: (0.7 + 0.3 * spread) * (1 + 0.12 * beat),
+                    child: Image.asset('assets/splash_rings.png', width: 120, height: 120, filterQuality: FilterQuality.high),
+                  ),
+                ),
+                Positioned(
+                  top: 236,
+                  left: -80,
+                  right: -80,
+                  child: Opacity(
+                    opacity: intro * (0.85 + 0.15 * beat),
+                    child: const Center(
+                      child: Text(appName, style: TextStyle(fontSize: 32, fontWeight: FontWeight.w800, color: Colors.white)),
+                    ),
+                  ),
+                ),
+              ]),
+            ),
+          ),
+        ]);
+      },
+    );
+  }
+}
+
+/// The green that spreads from the center of the screen until it covers all of it.
+class _RevealPainter extends CustomPainter {
+  final double spread; // 0..1
+  _RevealPainter(this.spread);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (spread <= 0) return;
+    final reach = math.sqrt(size.width * size.width + size.height * size.height) / 2; // center to a corner
+    canvas.drawCircle(size.center(Offset.zero), reach * spread, Paint()..color = _splashColor);
+  }
+
+  @override
+  bool shouldRepaint(_RevealPainter old) => old.spread != spread;
+}
+
+class _RipplePainter extends CustomPainter {
+  final double t; // 0..1 around the cycle
+  final double intro; // 0..1, fades the rings in
+  _RipplePainter(this.t, this.intro);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (intro <= 0) return;
+    final center = size.center(Offset.zero);
+    for (var i = 0; i < 3; i++) {
+      final p = (t + i / 3) % 1; // each ring is a third of a cycle behind the last
+      final radius = 62 + p * (size.width / 2 - 62);
+      final paint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3 * (1 - p) + 0.5
+        ..color = Colors.white.withValues(alpha: 0.45 * (1 - p) * intro);
+      canvas.drawCircle(center, radius, paint);
+    }
+  }
+
+  @override
+  bool shouldRepaint(_RipplePainter old) => old.t != t || old.intro != intro;
 }
 
 class LoginScreen extends StatefulWidget {
@@ -620,7 +759,7 @@ class _LoginScreenState extends State<LoginScreen> {
   final _email = TextEditingController();
   final _password = TextEditingController();
   final _code = TextEditingController();
-  bool _register = false, _busy = false, _hide = true;
+  bool _busy = false, _hide = true;
   bool _verifying = false; // true once the server asked for an email code; same form, second step
   bool _remember = false; // the "Remember me" box (starts unticked): stay signed in after the app closes
   String? _error;
@@ -658,7 +797,7 @@ class _LoginScreenState extends State<LoginScreen> {
     try {
       if (!_verifying) {
         final verificationRequired =
-            await api.login(_email.text.trim(), _password.text, register: _register, remember: _remember);
+            await api.login(_email.text.trim(), _password.text, remember: _remember);
         if (verificationRequired) {
           setState(() => _verifying = true); // show the code field; submitting again now confirms it
           return;
@@ -701,13 +840,41 @@ class _LoginScreenState extends State<LoginScreen> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
+        // Pinned to the bottom of the screen; hidden while the keyboard is open so it never crowds the form.
+        bottomNavigationBar: (_verifying || MediaQuery.of(context).viewInsets.bottom > 0)
+            ? null
+            : SafeArea(
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 8, 24, 16),
+                  // heightFactor: 1 is essential: a plain Center would grow to fill the whole screen here.
+                  child: Align(
+                    heightFactor: 1,
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 420),
+                      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                        Center(
+                          child: Text("Don't have an account yet?", style: TextStyle(color: Theme.of(context).hintColor)),
+                        ),
+                        const SizedBox(height: 8),
+                        OutlinedButton(
+                          style: _bigButton,
+                          onPressed: _busy
+                              ? null
+                              : () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const RegisterScreen())),
+                          child: const Text('Create an account', style: TextStyle(fontWeight: FontWeight.w700)),
+                        ),
+                      ]),
+                    ),
+                  ),
+                ),
+              ),
         body: SafeArea(
           child: Center(
             child: SingleChildScrollView(
               padding: const EdgeInsets.all(24),
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 420),
-                child: Form(
+                child: AutofillGroup(child: Form(
                   key: _formKey,
                   autovalidateMode: AutovalidateMode.onUserInteraction,
                   child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
@@ -718,6 +885,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     if (!_verifying) ...[
                       TextFormField(
                         controller: _email,
+                        autofillHints: [AutofillHints.username, AutofillHints.email],
                         keyboardType: TextInputType.emailAddress,
                         decoration: const InputDecoration(labelText: 'Email'),
                         validator: (v) {
@@ -730,10 +898,10 @@ class _LoginScreenState extends State<LoginScreen> {
                       const SizedBox(height: 12),
                       TextFormField(
                         controller: _password,
+                        autofillHints: [AutofillHints.password],
                         obscureText: _hide,
                         decoration: InputDecoration(
                           labelText: 'Password',
-                          helperText: _register ? 'At least 8 characters' : null,
                           suffixIcon: IconButton(
                             tooltip: _hide ? 'Show password' : 'Hide password',
                             icon: Icon(_hide ? Icons.visibility_outlined : Icons.visibility_off_outlined),
@@ -765,8 +933,7 @@ class _LoginScreenState extends State<LoginScreen> {
                             ),
                           ),
                         ),
-                        if (!_register)
-                          TextButton(
+                        TextButton(
                             onPressed: _busy
                                 ? null
                                 : () => Navigator.of(context).push(MaterialPageRoute(
@@ -781,7 +948,7 @@ class _LoginScreenState extends State<LoginScreen> {
                         description: 'We sent a code to ${_email.text.trim()}.',
                         busy: _busy,
                         onResend: () =>
-                            api.login(_email.text.trim(), _password.text, register: _register, remember: _remember),
+                            api.login(_email.text.trim(), _password.text, remember: _remember),
                         validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the code you were sent' : null,
                       ),
                       const SizedBox(height: 4),
@@ -801,7 +968,7 @@ class _LoginScreenState extends State<LoginScreen> {
                       onPressed: _busy ? null : _submit,
                       child: Text(_busy
                           ? 'Please wait...'
-                          : (_verifying ? 'Confirm code' : (_register ? 'Create account' : 'Sign in'))),
+                          : (_verifying ? 'Confirm code' : 'Sign in')),
                     ),
                     if (!_verifying) ...[
                       const SizedBox(height: 20),
@@ -838,16 +1005,254 @@ class _LoginScreenState extends State<LoginScreen> {
                           ),
                         ),
                       ),
-                      TextButton(
-                        onPressed: () => setState(() => _register = !_register),
-                        child: Text(_register ? 'I already have an account' : 'Create an account'),
-                      ),
                     ],
                   ]),
-                ),
+                )),
               ),
             ),
           ),
+        ),
+      );
+}
+
+// ---------- registration ----------
+/// The sign-up form: email, password (typed twice), mobile number, name, and the two agreements.
+/// Like login it has a second step when the server emails a code to confirm the address.
+class RegisterScreen extends StatefulWidget {
+  const RegisterScreen({super.key});
+  @override
+  State<RegisterScreen> createState() => _RegisterScreenState();
+}
+
+class _RegisterScreenState extends State<RegisterScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _email = TextEditingController();
+  final _password = TextEditingController();
+  final _confirm = TextEditingController();
+  final _mobile = TextEditingController();
+  final _first = TextEditingController();
+  final _last = TextEditingController();
+  final _code = TextEditingController();
+  bool _hide = true, _busy = false, _verifying = false;
+  bool _privacy = false, _terms = false, _agreeError = false;
+  bool _remember = false; // follows the login screen's "Remember me" box
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    api.loadRememberMe().then((v) => _remember = v);
+  }
+
+  @override
+  void dispose() {
+    for (final c in [_email, _password, _confirm, _mobile, _first, _last, _code]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final valid = _formKey.currentState!.validate();
+    if (!_verifying) {
+      setState(() => _agreeError = !(_privacy && _terms));
+      if (!valid || !(_privacy && _terms)) return;
+    } else if (!valid) {
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      if (!_verifying) {
+        final verificationRequired = await api.register(
+          email: _email.text.trim(),
+          password: _password.text,
+          firstName: _first.text.trim(),
+          lastName: _last.text.trim(),
+          mobile: _mobile.text.trim(),
+          remember: _remember,
+        );
+        if (verificationRequired) {
+          setState(() => _verifying = true);
+          return;
+        }
+      } else {
+        await api.confirmEmailVerification(_email.text.trim(), _code.text.trim(), remember: _remember);
+      }
+      if (!mounted) return;
+      Navigator.of(context).pushAndRemoveUntil(MaterialPageRoute(builder: (_) => const Shell()), (r) => false);
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  void _showDocument(String title) => showDialog<void>(
+        context: context,
+        builder: (c) => AlertDialog(
+          title: Text(title),
+          content: Text('The full $title will be shown here.'),
+          actions: [TextButton(onPressed: () => Navigator.pop(c), child: const Text('Close'))],
+        ),
+      );
+
+  Widget _agreement({
+    required bool value,
+    required ValueChanged<bool> onChanged,
+    required String before,
+    required String link,
+    required String title,
+  }) =>
+      Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Checkbox(value: value, onChanged: _busy ? null : (v) => onChanged(v ?? false)),
+        Expanded(
+          child: Padding(
+            padding: const EdgeInsets.only(top: 12),
+            child: Text.rich(TextSpan(children: [
+              TextSpan(text: before),
+              TextSpan(
+                text: link,
+                style: TextStyle(
+                  // A link blue that stays readable on both themes, bold and underlined so it clearly reads as tappable.
+                  color: Theme.of(context).brightness == Brightness.dark
+                      ? const Color(0xFF8AB4F8)
+                      : const Color(0xFF1A5FD0),
+                  fontWeight: FontWeight.w700,
+                  decoration: TextDecoration.underline,
+                ),
+                recognizer: TapGestureRecognizer()..onTap = () => _showDocument(title),
+              ),
+              const TextSpan(text: '.'),
+            ])),
+          ),
+        ),
+      ]);
+
+  String? _required(String? v, String what) => (v == null || v.trim().isEmpty) ? 'Enter your $what' : null;
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(),
+        body: SafeArea(
+          child: AutofillGroup(child: Form(
+            key: _formKey,
+            autovalidateMode: AutovalidateMode.onUserInteraction,
+            child: ListView(padding: const EdgeInsets.fromLTRB(24, 0, 24, 24), children: [
+              const Text('Registration', style: TextStyle(fontSize: 32, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 20),
+              if (!_verifying) ...[
+                TextFormField(
+                  controller: _email,
+                  autofillHints: [AutofillHints.username, AutofillHints.email],
+                  keyboardType: TextInputType.emailAddress,
+                  decoration: const InputDecoration(labelText: 'Email', hintText: 'juandelacruz@gmail.com'),
+                  validator: (v) {
+                    final value = v?.trim() ?? '';
+                    if (value.isEmpty) return 'Enter your email';
+                    if (!value.contains('@') || !value.contains('.')) return 'Enter a valid email';
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 12),
+                _passwordField(
+                  controller: _password,
+                  autofillHints: [AutofillHints.newPassword],
+                  label: 'Password',
+                  helper: 'Password must be 8 characters or more with an uppercase character and a number',
+                  hide: _hide,
+                  onToggle: () => setState(() => _hide = !_hide),
+                  validator: (v) {
+                    final value = v ?? '';
+                    if (value.isEmpty) return 'Enter a password';
+                    if (value.length < 8 || !value.contains(RegExp('[A-Z]')) || !value.contains(RegExp('[0-9]'))) {
+                      return '8+ characters, an uppercase letter and a number';
+                    }
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 12),
+                _passwordField(
+                  controller: _confirm,
+                  autofillHints: [AutofillHints.newPassword],
+                  label: 'Confirm password',
+                  hide: _hide,
+                  onToggle: () => setState(() => _hide = !_hide),
+                  validator: (v) => v != _password.text ? "Passwords don't match" : null,
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _mobile,
+                  autofillHints: const [AutofillHints.telephoneNumber],
+                  keyboardType: TextInputType.phone,
+                  decoration: const InputDecoration(labelText: 'Mobile number', hintText: '09XX-XXX-XXXX'),
+                  validator: _mobileValidator,
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _first,
+                  autofillHints: const [AutofillHints.givenName],
+                  textCapitalization: TextCapitalization.words,
+                  decoration: const InputDecoration(labelText: 'First name'),
+                  validator: (v) => _required(v, 'first name'),
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _last,
+                  autofillHints: const [AutofillHints.familyName],
+                  textCapitalization: TextCapitalization.words,
+                  decoration: const InputDecoration(labelText: 'Last name'),
+                  validator: (v) => _required(v, 'last name'),
+                ),
+                const SizedBox(height: 16),
+                _agreement(
+                  value: _privacy,
+                  onChanged: (v) => setState(() => _privacy = v),
+                  before: 'I understand that $appName will use the information I submit in accordance with its ',
+                  link: 'PRIVACY POLICY',
+                  title: 'Privacy Policy',
+                ),
+                _agreement(
+                  value: _terms,
+                  onChanged: (v) => setState(() => _terms = v),
+                  before: 'I have read and understood the ',
+                  link: 'TERMS & CONDITIONS',
+                  title: 'Terms & Conditions',
+                ),
+                if (_agreeError && !(_privacy && _terms))
+                  const Padding(
+                    padding: EdgeInsets.only(top: 4, left: 12),
+                    child: Text('Please tick both boxes to continue.', style: TextStyle(color: Color(0xFFB42318))),
+                  ),
+              ] else ...[
+                stepTwoDots(context),
+                CodeEntry(
+                  controller: _code,
+                  description: 'We sent a code to ${_email.text.trim()}.',
+                  busy: _busy,
+                  onResend: () => api.login(_email.text.trim(), _password.text, remember: _remember),
+                  validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the code you were sent' : null,
+                ),
+                TextButton(
+                  onPressed: _busy ? null : () => setState(() => _verifying = false),
+                  child: const Text('Use a different email'),
+                ),
+              ],
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318))),
+                ),
+              const SizedBox(height: 20),
+              FilledButton(
+                style: _bigButton,
+                onPressed: _busy ? null : _submit,
+                child: Text(_busy ? 'Please wait...' : (_verifying ? 'Confirm code' : 'Create account')),
+              ),
+            ]),
+          )),
         ),
       );
 }
@@ -914,7 +1319,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(title: Text(_codeSent ? 'Enter the code' : 'Reset password')),
         body: SafeArea(
-          child: Form(
+          child: AutofillGroup(child: Form(
             key: _formKey,
             autovalidateMode: AutovalidateMode.onUserInteraction,
             child: ListView(padding: const EdgeInsets.all(24), children: [
@@ -923,6 +1328,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                 const SizedBox(height: 20),
                 TextFormField(
                   controller: _email,
+                  autofillHints: [AutofillHints.email],
                   keyboardType: TextInputType.emailAddress,
                   decoration: const InputDecoration(labelText: 'Email'),
                   validator: (v) {
@@ -944,10 +1350,11 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                 const SizedBox(height: 12),
                 TextFormField(
                   controller: _password,
+                  autofillHints: [AutofillHints.newPassword],
                   obscureText: _hide,
                   decoration: InputDecoration(
                     labelText: 'New password',
-                    helperText: 'At least 8 characters',
+                    helperText: 'Password must be 8 characters or more with an uppercase character and a number',
                     suffixIcon: IconButton(
                       tooltip: _hide ? 'Show password' : 'Hide password',
                       icon: Icon(_hide ? Icons.visibility_outlined : Icons.visibility_off_outlined),
@@ -957,13 +1364,15 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                   validator: (v) {
                     final value = v ?? '';
                     if (value.isEmpty) return 'Enter a new password';
-                    if (value.length < 8) return 'At least 8 characters';
+                    final problem = _newPasswordProblem(value);
+                    if (problem != null) return problem;
                     return null;
                   },
                 ),
                 const SizedBox(height: 12),
                 TextFormField(
                   controller: _confirm,
+                  autofillHints: [AutofillHints.newPassword],
                   obscureText: _hide,
                   decoration: const InputDecoration(labelText: 'Confirm new password'),
                   validator: (v) => v != _password.text ? "Passwords don't match" : null,
@@ -986,13 +1395,14 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                 child: Text(_busy ? 'Please wait...' : (_codeSent ? 'Reset password' : 'Send code')),
               ),
             ]),
-          ),
+          )),
         ),
       );
 }
 
 // ---------- link an account ----------
 class LinkAccountScreen extends StatefulWidget {
+  /// Called after a request has been filed, so the caller can reload (it may now have a pending request to show).
   final Future<void> Function() onLinked;
   const LinkAccountScreen({super.key, required this.onLinked});
   @override
@@ -1002,11 +1412,38 @@ class LinkAccountScreen extends StatefulWidget {
 class _LinkAccountScreenState extends State<LinkAccountScreen> {
   final _formKey = GlobalKey<FormState>();
   final _no = TextEditingController();
-  final _mobile = TextEditingController();
-  final _code = TextEditingController();
-  bool _otpSent = false; // true once the server asked for a code; same form, second step
   bool _busy = false;
   String? _error;
+  List<Map<String, dynamic>> _declined = []; // earlier requests that were turned down, shown as a note
+
+  @override
+  void initState() {
+    super.initState();
+    _loadDeclined();
+  }
+
+  Future<void> _loadDeclined() async {
+    try {
+      final all = await api.linkRequests();
+      final declined = [for (final r in all) if (r['status'] == 'REJECTED') Map<String, dynamic>.from(r as Map)];
+      if (mounted) setState(() => _declined = declined);
+    } catch (_) {
+      // Only a courtesy note: never block linking over it.
+    }
+  }
+
+  Future<void> _dismiss(Map<String, dynamic> r) async {
+    setState(() => _declined.remove(r));
+    try {
+      await api.dismissLinkRequest(r['id'] as int);
+    } catch (_) {}
+  }
+
+  @override
+  void dispose() {
+    _no.dispose();
+    super.dispose();
+  }
 
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
@@ -1015,15 +1452,11 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
       _error = null;
     });
     try {
-      if (!_otpSent) {
-        final otpRequired = await api.startLinkAccount(_no.text.trim(), _mobile.text.trim());
-        if (otpRequired) {
-          setState(() => _otpSent = true); // show the code field; submitting again now confirms it
-          return;
-        }
-      } else {
-        await api.confirmLinkAccount(_no.text.trim(), _mobile.text.trim(), _code.text.trim());
-      }
+      await api.requestLink(_no.text.trim());
+      if (!mounted) return;
+      await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => RequestReceivedScreen(onBack: () => Navigator.of(context).pop()),
+      ));
       await widget.onLinked();
       if (mounted && Navigator.of(context).canPop()) Navigator.of(context).pop();
     } catch (e) {
@@ -1036,54 +1469,89 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
   @override
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(
-          title: Text(_otpSent ? 'Enter the code' : 'Link your account'),
           actions: [IconButton(tooltip: 'Sign out', icon: const Icon(Icons.logout), onPressed: () => signOut(context))],
         ),
-        body: Form(
-          key: _formKey,
-          autovalidateMode: AutovalidateMode.onUserInteraction,
-          child: ListView(padding: const EdgeInsets.all(24), children: [
-            if (!_otpSent) ...[
-              const Text('Enter the account number on your bill and the mobile number registered to it.'),
-              const SizedBox(height: 20),
+        body: SafeArea(
+          child: Form(
+            key: _formKey,
+            autovalidateMode: AutovalidateMode.onUserInteraction,
+            child: ListView(padding: const EdgeInsets.fromLTRB(24, 0, 24, 24), children: [
+              const Text('Link your Account', style: TextStyle(fontSize: 32, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 12),
+              const Text("Enter the account number on your bill and we'll link it to your login once we've "
+                  'checked it.'),
+              const SizedBox(height: 24),
+              for (final r in _declined)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 16),
+                  child: Panel(
+                    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Icon(Icons.info_outline, color: Color(0xFFB42318)),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text("Your request to link account ${r['account_no']} was declined. If you think "
+                            'that was a mistake, please contact us. You can check the number and send a new request below.'),
+                      ),
+                      IconButton(
+                        tooltip: 'Dismiss',
+                        icon: const Icon(Icons.close),
+                        visualDensity: VisualDensity.compact,
+                        onPressed: () => _dismiss(r),
+                      ),
+                    ]),
+                  ),
+                ),
               TextFormField(
                 controller: _no,
-                decoration: const InputDecoration(labelText: 'Account number'),
+                textCapitalization: TextCapitalization.characters,
+                decoration: const InputDecoration(labelText: 'Account number', hintText: 'DEMO-000001'),
                 validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter your account number' : null,
               ),
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318))),
+                ),
+              const SizedBox(height: 20),
+              FilledButton(
+                style: _bigButton,
+                onPressed: _busy ? null : _submit,
+                child: Text(_busy ? 'Please wait...' : 'Submit'),
+              ),
+            ]),
+          ),
+        ),
+      );
+}
+
+/// "Request Received!": shown right after a link request is filed, and again whenever the login has no
+/// account yet but a request is still waiting.
+class RequestReceivedScreen extends StatelessWidget {
+  final VoidCallback onBack;
+  final String buttonLabel;
+  final Widget? extra; // optional second action under the message (e.g. "Check status")
+  const RequestReceivedScreen({super.key, required this.onBack, this.buttonLabel = 'Back to Menu', this.extra});
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        body: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(children: [
+              const Spacer(flex: 2),
+              const Text(appName, style: TextStyle(fontSize: 36, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 32),
+              const Text('Request Received!', style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700)),
               const SizedBox(height: 12),
-              TextFormField(
-                controller: _mobile,
-                keyboardType: TextInputType.phone,
-                decoration: const InputDecoration(labelText: 'Registered mobile number'),
-                validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the registered mobile number' : null,
+              const Text(
+                'We have received your Link Account request, and we will process it within 24 hours.',
+                textAlign: TextAlign.center,
               ),
-            ] else ...[
-              stepTwoDots(context),
-              CodeEntry(
-                controller: _code,
-                description: 'We sent a code by SMS to ${_mobile.text.trim()}.',
-                busy: _busy,
-                onResend: () => api.startLinkAccount(_no.text.trim(), _mobile.text.trim()),
-                validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the code you were sent' : null,
-              ),
-              const SizedBox(height: 4),
-              TextButton(
-                onPressed: _busy ? null : () => setState(() => _otpSent = false),
-                child: const Text('Use a different number'),
-              ),
-            ],
-            if (_error != null)
-              Padding(padding: const EdgeInsets.only(top: 12), child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318)))),
-            const SizedBox(height: 20),
-            FilledButton(
-              style: _bigButton,
-              onPressed: _busy ? null : _submit,
-              child: Text(_busy ? 'Please wait...' : (_otpSent ? 'Confirm code' : 'Link account')),
-            ),
-            const SizedBox(height: 16),
-            if (!_otpSent) const Text('Demo data: DEMO-000001 with 09913187942, or DEMO-000002 with 5550100002.'),
-          ]),
+              if (extra != null) ...[const SizedBox(height: 12), extra!],
+              const Spacer(flex: 3),
+              FilledButton(style: _bigButton, onPressed: onBack, child: Text(buttonLabel)),
+            ]),
+          ),
         ),
       );
 }
@@ -1099,6 +1567,8 @@ class _ShellState extends State<Shell> {
   List<Map<String, dynamic>> _accounts = [];
   int _sel = 0, _tab = 0, _version = 0;
   bool _loading = true;
+  bool _hasPending = false; // no account yet, but a link request is waiting for approval
+  bool _linkAnother = false; // the user chose to file another request from the waiting screen
   String? _error;
 
   @override
@@ -1112,6 +1582,7 @@ class _ShellState extends State<Shell> {
       final list = await api.accounts();
       _accounts = [for (final e in list) Map<String, dynamic>.from(e as Map)];
       if (_sel >= _accounts.length) _sel = 0;
+      _hasPending = _accounts.isEmpty && (await api.linkRequests()).any((r) => r['status'] == 'PENDING');
       _error = null;
       for (final a in _accounts) {
         await scheduleDueReminder(
@@ -1162,7 +1633,22 @@ class _ShellState extends State<Shell> {
         ),
       );
     }
-    if (_accounts.isEmpty) return LinkAccountScreen(onLinked: _load);
+    if (_accounts.isEmpty && _hasPending && !_linkAnother) {
+      return RequestReceivedScreen(
+        buttonLabel: 'Check status',
+        onBack: () {
+          setState(() => _loading = true);
+          _load();
+        },
+        extra: TextButton(onPressed: () => setState(() => _linkAnother = true), child: const Text('Link a different account')),
+      );
+    }
+    if (_accounts.isEmpty) {
+      return LinkAccountScreen(onLinked: () async {
+        _linkAnother = false;
+        await _load();
+      });
+    }
 
     final acct = _accounts[_sel];
     final key = ValueKey('$_tab-${acct['id']}-$_version');
@@ -1365,13 +1851,17 @@ class PlansPage extends StatelessWidget {
 
   Future<void> _choose(BuildContext context, Map p) async {
     final messenger = ScaffoldMessenger.of(context);
-    try {
-      await api.upgrade(acct['id'] as int, p['id'] as int);
-      await onChanged();
-      messenger.showSnackBar(SnackBar(content: Text('Switched to the ${p['name']} plan.')));
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
-    }
+    final ok = await confirmWithPassword(
+      context,
+      title: 'Switch to the ${p['name']} plan?',
+      message: 'Your plan and monthly bill will change.',
+      confirmLabel: 'Switch',
+      busyLabel: 'Switching...',
+      action: (pw) => api.upgrade(acct['id'] as int, p['id'] as int, pw),
+    );
+    if (!ok) return;
+    await onChanged();
+    messenger.showSnackBar(SnackBar(content: Text('Switched to the ${p['name']} plan.')));
   }
 
   @override
@@ -1441,19 +1931,23 @@ class _AddOnsScreenState extends State<AddOnsScreen> {
   Future<void> _toggle(Map addon, bool isActive) async {
     final messenger = ScaffoldMessenger.of(context);
     final id = widget.acct['id'] as int;
-    try {
-      if (isActive) {
-        await api.unsubscribeAddon(id, addon['id'] as int);
-      } else {
-        await api.subscribeAddon(id, addon['id'] as int);
-      }
-      await widget.onChanged(); // refreshes the account balance shown on Home/Bills
-      if (mounted) setState(() => _version++); // refetches this screen's own list
-      messenger.showSnackBar(
-          SnackBar(content: Text(isActive ? 'Removed ${addon['name']}.' : 'Added ${addon['name']}.')));
-    } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('$e')));
-    }
+    final ok = await confirmWithPassword(
+      context,
+      title: isActive ? 'Remove ${addon['name']}?' : 'Add ${addon['name']}?',
+      message: isActive
+          ? 'It will come off your bill.'
+          : '${peso(addon['monthly_fee'] as int)}/month will be added to your current bill.',
+      confirmLabel: isActive ? 'Remove' : 'Add',
+      busyLabel: isActive ? 'Removing...' : 'Adding...',
+      action: (pw) => isActive
+          ? api.unsubscribeAddon(id, addon['id'] as int, pw)
+          : api.subscribeAddon(id, addon['id'] as int, pw),
+    );
+    if (!ok) return;
+    await widget.onChanged(); // refreshes the account balance shown on Home/Bills
+    if (mounted) setState(() => _version++); // refetches this screen's own list
+    messenger.showSnackBar(
+        SnackBar(content: Text(isActive ? 'Removed ${addon['name']}.' : 'Added ${addon['name']}.')));
   }
 
   @override
@@ -1502,28 +1996,9 @@ class _AccountPageState extends State<AccountPage> {
   /// Changing the email or mobile number, and deleting the account, all ask for the current password, and
   /// a login made only through Google has none yet. Offers to set one (through the same emailed-code flow as
   /// "Forgot password") and returns whether the caller can go ahead.
-  Future<bool> _hasPasswordOrOffer(Map<String, dynamic> me) async {
-    if (me['has_password'] == true) return true;
-    final setNow = await showDialog<bool>(
-      context: context,
-      builder: (c) => AlertDialog(
-        title: const Text('Set a password first'),
-        content: const Text("This needs your password, and you signed in with Google so you don't have one yet. "
-            "Set one now: we'll email you a code, and you'll sign in again afterwards."),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Not now')),
-          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Set password')),
-        ],
-      ),
-    );
-    if (setNow == true && mounted) _openSetPassword(me);
-    return false;
-  }
+  Future<bool> _hasPasswordOrOffer(Map<String, dynamic> me) => _ensurePassword(context, me);
 
-  void _openSetPassword(Map<String, dynamic> me) {
-    Navigator.of(context)
-        .push(MaterialPageRoute(builder: (_) => ForgotPasswordScreen(initialEmail: '${me['email']}')));
-  }
+  void _openSetPassword(Map<String, dynamic> me) => _openSetPasswordScreen(context, me);
 
   Future<void> _changeEmail(Map<String, dynamic> me) async {
     if (!await _hasPasswordOrOffer(me) || !mounted) return;
@@ -1701,9 +2176,11 @@ Widget _passwordField({
   required VoidCallback onToggle,
   required String? Function(String?) validator,
   String? helper,
+  Iterable<String>? autofillHints,
 }) =>
     TextFormField(
       controller: controller,
+      autofillHints: autofillHints,
       obscureText: hide,
       decoration: InputDecoration(
         labelText: label,
@@ -1724,9 +2201,17 @@ String? _emailValidator(String? v) {
   return null;
 }
 
+/// The rule for a new password, matching the server's. Null when it's fine.
+String? _newPasswordProblem(String value) {
+  if (value.length < 8 || !value.contains(RegExp('[A-Z]')) || !value.contains(RegExp('[0-9]'))) {
+    return '8+ characters, an uppercase letter and a number';
+  }
+  return null;
+}
+
 String? _mobileValidator(String? v) {
   final value = (v ?? '').replaceAll(RegExp(r'[\s-]'), '');
-  if (value.isEmpty) return 'Enter the new mobile number';
+  if (value.isEmpty) return 'Enter a mobile number';
   if (!RegExp(r'^\+?\d{10,13}$').hasMatch(value)) return 'Enter a valid mobile number';
   return null;
 }
@@ -1826,6 +2311,7 @@ class _ChangeContactScreenState extends State<ChangeContactScreen> {
                 const SizedBox(height: 12),
                 _passwordField(
                   controller: _password,
+                  autofillHints: [AutofillHints.password],
                   label: 'Current password',
                   hide: _hide,
                   onToggle: () => setState(() => _hide = !_hide),
@@ -1911,12 +2397,13 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(title: const Text('Change password')),
         body: SafeArea(
-          child: Form(
+          child: AutofillGroup(child: Form(
             key: _formKey,
             autovalidateMode: AutovalidateMode.onUserInteraction,
             child: ListView(padding: const EdgeInsets.all(24), children: [
               _passwordField(
                 controller: _current,
+                autofillHints: [AutofillHints.password],
                 label: 'Current password',
                 hide: _hideCurrent,
                 onToggle: () => setState(() => _hideCurrent = !_hideCurrent),
@@ -1925,14 +2412,16 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
               const SizedBox(height: 12),
               _passwordField(
                 controller: _new,
+                autofillHints: [AutofillHints.newPassword],
                 label: 'New password',
-                helper: 'At least 8 characters',
+                helper: 'Password must be 8 characters or more with an uppercase character and a number',
                 hide: _hideNew,
                 onToggle: () => setState(() => _hideNew = !_hideNew),
                 validator: (v) {
                   final value = v ?? '';
                   if (value.isEmpty) return 'Enter a new password';
-                  if (value.length < 8) return 'At least 8 characters';
+                  final problem = _newPasswordProblem(value);
+                    if (problem != null) return problem;
                   if (value == _current.text) return "Choose a password that's different from your current one";
                   return null;
                 },
@@ -1940,6 +2429,7 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
               const SizedBox(height: 12),
               _passwordField(
                 controller: _confirm,
+                autofillHints: [AutofillHints.newPassword],
                 label: 'Confirm new password',
                 hide: _hideNew,
                 onToggle: () => setState(() => _hideNew = !_hideNew),
@@ -1957,9 +2447,66 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
                 child: Text(_busy ? 'Please wait...' : 'Change password'),
               ),
             ]),
-          ),
+          )),
         ),
       );
+}
+
+/// True when this login has a password to confirm with. A Google-only login doesn't yet, so it's offered
+/// the set-a-password flow instead and this returns false.
+Future<bool> _ensurePassword(BuildContext context, Map<String, dynamic> me) async {
+  if (me['has_password'] == true) return true;
+  final setNow = await showDialog<bool>(
+    context: context,
+    builder: (c) => AlertDialog(
+      title: const Text('Set a password first'),
+      content: const Text("This needs your password, and you signed in with Google so you don't have one yet. "
+          "Set one now: we'll email you a code, and you'll sign in again afterwards."),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Not now')),
+        FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Set password')),
+      ],
+    ),
+  );
+  if (setNow == true && context.mounted) _openSetPasswordScreen(context, me);
+  return false;
+}
+
+void _openSetPasswordScreen(BuildContext context, Map<String, dynamic> me) {
+  Navigator.of(context)
+      .push(MaterialPageRoute(builder: (_) => ForgotPasswordScreen(initialEmail: '${me['email']}')));
+}
+
+/// The usual "type your password to confirm" step for any change: checks the login has a password,
+/// shows the dialog, and runs [action] with it. True once the action has gone through.
+Future<bool> confirmWithPassword(
+  BuildContext context, {
+  required String title,
+  required String message,
+  required String confirmLabel,
+  required String busyLabel,
+  required Future<void> Function(String password) action,
+}) async {
+  final messenger = ScaffoldMessenger.of(context);
+  Map<String, dynamic> me;
+  try {
+    me = await api.me();
+  } catch (e) {
+    messenger.showSnackBar(SnackBar(content: Text('$e')));
+    return false;
+  }
+  if (!context.mounted || !await _ensurePassword(context, me) || !context.mounted) return false;
+  final done = await showDialog<bool>(
+    context: context,
+    builder: (_) => _PasswordConfirmDialog(
+      title: title,
+      message: message,
+      confirmLabel: confirmLabel,
+      busyLabel: busyLabel,
+      action: action,
+    ),
+  );
+  return done == true;
 }
 
 /// Asks for the password one more time before something is changed or removed. [action] runs with the
@@ -2022,6 +2569,7 @@ class _PasswordConfirmDialogState extends State<_PasswordConfirmDialog> {
             const SizedBox(height: 16),
             _passwordField(
               controller: _password,
+              autofillHints: [AutofillHints.password],
               label: 'Password',
               hide: _hide,
               onToggle: () => setState(() => _hide = !_hide),
