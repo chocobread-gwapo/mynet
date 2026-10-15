@@ -343,7 +343,7 @@ def account_view(a: Account, db: Session) -> dict:
     plan = db.get(Plan, a.plan_id)
     return {
         "id": a.id, "account_no": a.account_no, "holder_name": a.holder_name, "status": a.status,
-        "service_address": a.service_address, "due_date": a.due_date.isoformat(),
+        "service_address": a.service_address, "mobile": a.mobile, "due_date": a.due_date.isoformat(),
         "plan": {"id": plan.id, "name": plan.name, "speed_mbps": plan.speed_mbps, "monthly_fee": plan.monthly_fee},
         **money(a.balance),
     }
@@ -528,31 +528,59 @@ def forgot_password(body: ForgotPasswordBody, background: BackgroundTasks, db: S
     return {"ok": True}
 
 
-def _send_password_changed_email(email: str) -> None:
-    """Background task: a heads-up that the password just changed, so a reset the owner didn't ask for
-    gets noticed. Failures are printed to the console, never raised."""
-    when = datetime.now(timezone(timedelta(hours=8))).strftime("%b %d, %Y at %I:%M %p")  # Philippine time
+def _ph_time_text() -> str:
+    """The current time the way people in the Philippines read it, for security notices."""
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%b %d, %Y at %I:%M %p") + ", Philippine time"
+
+
+def _send_notice_email(email: str, subject: str, message: str) -> None:
+    """Background task: sends a plain email notice. Failures are printed to the console, never raised."""
     try:
-        _deliver_email_code(
-            email, "",
-            subject="Your NetPulse password was changed",
-            message=f"The password for your NetPulse account was just changed ({when}, Philippine time).\n\n"
-                    "If this was you, no action is needed.\n"
-                    "If it wasn't, open NetPulse and tap Forgot password to reset it again right away.",
-        )
+        _deliver_email_code(email, "", subject=subject, message=message)
     except HTTPException as e:
-        print(f"[password reset] could not email the change notice to {email}: {e.detail}")
+        print(f"[notice] could not email {email}: {e.detail}")
 
 
-async def _send_password_changed_sms(mobile: str) -> None:
-    """Background task: the same heads-up by text, to a number on one of the user's linked accounts."""
+async def _send_notice_sms(mobile: str, message: str) -> None:
+    """Background task: sends a plain text-message notice. Failures are printed, never raised."""
     try:
-        await _deliver_sms_code(
-            mobile, "",
-            message="NetPulse: your password was just changed. If this wasn't you, use Forgot password in the app now.",
-        )
+        await _deliver_sms_code(mobile, "", message=message)
     except (HTTPException, httpx.HTTPError) as e:
-        print(f"[password reset] could not text the change notice to {mobile}: {getattr(e, 'detail', e)}")
+        print(f"[notice] could not text {mobile}: {getattr(e, 'detail', e)}")
+
+
+def _linked_mobiles(db: Session, user: User) -> list[str]:
+    """Users have no phone number of their own here: numbers live on the accounts they've linked, so
+    texts go to each distinct number on those."""
+    rows = db.scalars(select(Account).join(Link, Link.account_id == Account.id).where(Link.user_id == user.id))
+    return sorted({a.mobile for a in rows})
+
+
+def _queue_notices(background: BackgroundTasks, *, label: str, email: str | None, mobiles: list[str],
+                   subject: str, email_text: str, sms_text: str) -> None:
+    """Emails and texts a security notice once the response has gone out, through whichever providers
+    are configured, so a failed send never changes what the caller sees."""
+    if SMTP_USERNAME and email:
+        background.add_task(_send_notice_email, email, subject, email_text)
+    if TEXTBEE_API_KEY:
+        for mobile in mobiles:
+            background.add_task(_send_notice_sms, mobile, sms_text)
+    if not SMTP_USERNAME and not TEXTBEE_API_KEY:
+        # Dev-mode fallback: no providers configured yet, so just show what would have been sent.
+        print(f"[{label}] would notify {email} by email and {mobiles or 'no linked numbers'} by SMS")
+
+
+def _notify_password_changed(background: BackgroundTasks, db: Session, user: User, label: str) -> None:
+    """The "your password was changed" heads-up, by email and text, so a change the owner didn't make
+    gets noticed. Shared by the reset flow and the Account tab's change-password."""
+    _queue_notices(
+        background, label=label, email=user.email, mobiles=_linked_mobiles(db, user),
+        subject="Your NetPulse password was changed",
+        email_text=f"The password for your NetPulse account was just changed ({_ph_time_text()}).\n\n"
+                   "If this was you, no action is needed.\n"
+                   "If it wasn't, open NetPulse and tap Forgot password to reset it again right away.",
+        sms_text="NetPulse: your password was just changed. If this wasn't you, use Forgot password in the app now.",
+    )
 
 
 @app.post("/api/v1/auth/reset-password")
@@ -571,18 +599,7 @@ def reset_password(body: ResetPasswordBody, background: BackgroundTasks, db: Ses
     # No token comes back: the new hash already invalidated every login this user had (see _pw_version),
     # so they sign in again with the new password.
 
-    # Tell the owner by email and by text. Users have no phone number of their own here — numbers live on
-    # the accounts they've linked — so the text goes to each distinct number on those.
-    mobiles = sorted({a.mobile for a in db.scalars(
-        select(Account).join(Link, Link.account_id == Account.id).where(Link.user_id == user.id))})
-    if SMTP_USERNAME:
-        background.add_task(_send_password_changed_email, user.email)
-    if TEXTBEE_API_KEY:
-        for mobile in mobiles:
-            background.add_task(_send_password_changed_sms, mobile)
-    if not SMTP_USERNAME and not TEXTBEE_API_KEY:
-        # Dev-mode fallback: no providers configured yet, so just show what would have been sent.
-        print(f"[password reset] would notify {user.email} by email and {mobiles or 'no linked numbers'} by SMS")
+    _notify_password_changed(background, db, user, "password reset")  # by email and by text
     return {"ok": True}
 
 
@@ -755,12 +772,233 @@ def get_account(a: Account = Depends(my_account), db: Session = Depends(get_db))
     return account_view(a, db)
 
 
-@app.delete("/api/v1/accounts/{account_id}/link", status_code=204)
-def unlink(account_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+class UnlinkBody(BaseModel):
+    current_password: str
+
+
+@app.post("/api/v1/accounts/{account_id}/unlink", status_code=204)
+def unlink(account_id: int, body: UnlinkBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Used to be a plain DELETE with no body; now it asks for the password like every other change to
+    the user's own details (and there is deliberately no password-free route left)."""
+    rate_limit(f"me-unlink:{user.id}")
+    _require_password(user, body.current_password)
     link = db.get(Link, (user.id, account_id))
     if link:
         db.delete(link)
         db.commit()
+
+
+# ---------- my profile: password, email, mobile number, delete ----------
+class CodeBody(BaseModel):
+    code: str
+
+
+class ChangePasswordBody(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class EmailChangeBody(BaseModel):
+    new_email: str
+    current_password: str
+
+
+class MobileChangeBody(BaseModel):
+    new_mobile: str
+    current_password: str
+
+
+class DeleteMeBody(BaseModel):
+    current_password: str
+
+
+# Codes for the two "confirm the new contact detail" flows, one dict each (unrelated flows, so no shared
+# namespace). Value: (code, expires_at, the new email / mobile number the code is for). In-memory, like
+# the other pending codes: lost on restart.
+_pending_email_changes: dict[int, tuple[str, float, str]] = {}  # user id -> ...
+_pending_mobile_changes: dict[tuple[int, int], tuple[str, float, str]] = {}  # (user id, account id) -> ...
+
+
+def _check_pending_change(store: dict, key, code: str) -> str | None:
+    """Returns the new email / mobile number on a correct, unexpired code (consuming it), else None."""
+    pending = store.get(key)
+    if not pending:
+        return None
+    stored_code, expires_at, value = pending
+    if time.time() >= expires_at:
+        store.pop(key, None)
+        return None
+    if not hmac.compare_digest(stored_code, code):
+        return None
+    store.pop(key, None)
+    return value
+
+
+def _require_password(user: User, password: str) -> None:
+    """Sensitive changes ask for the current password again. A wrong one answers 403, never 401: the app
+    treats any 401 on a request that carried its login as "your session expired" and signs the user out.
+    A Google-only account has no password yet, so it has to set one first (via Forgot password)."""
+    if not user.password_hash:
+        raise HTTPException(409, "Set a password first (use Forgot password to create one), then try again.")
+    if not check_pw(password, user.password_hash):
+        raise HTTPException(403, "That password is incorrect")
+
+
+def _normalize_mobile(raw: str) -> str | None:
+    """Drops spaces and dashes and turns +63 / 63 numbers into the local 09XXXXXXXXX form the accounts
+    use. None if it doesn't look like a phone number."""
+    n = "".join(ch for ch in raw if ch not in " -")
+    core = n[1:] if n.startswith("+") else n
+    if not core.isdigit() or not 10 <= len(core) <= 13:
+        return None
+    if core.startswith("63") and len(core) == 12:
+        return "0" + core[2:]
+    return n
+
+
+@app.get("/api/v1/me")
+def get_me(user: User = Depends(current_user)):
+    return {"email": user.email, "has_password": bool(user.password_hash)}
+
+
+@app.post("/api/v1/me/password")
+def change_password(body: ChangePasswordBody, background: BackgroundTasks,
+                    user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rate_limit(f"me-password:{user.id}")
+    _require_password(user, body.current_password)
+    if len(body.new_password) < 8:
+        raise HTTPException(422, "Password must be at least 8 characters")
+    if body.new_password == body.current_password:
+        raise HTTPException(422, "Choose a password that's different from your current one")
+    user.password_hash = hash_pw(body.new_password)
+    db.commit()
+    _notify_password_changed(background, db, user, "password change")
+    # The new hash ended every login this user had, including the one making this request, so hand back
+    # a fresh token for this device. Other devices have to sign in again.
+    return {"token": make_token(user)}
+
+
+@app.post("/api/v1/me/email/start")
+def start_email_change(body: EmailChangeBody, background: BackgroundTasks,
+                       user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rate_limit(f"me-email:{user.id}")
+    _require_password(user, body.current_password)
+    new_email = body.new_email.strip().lower()
+    if "@" not in new_email or "." not in new_email:
+        raise HTTPException(422, "Enter a valid email address")
+    if new_email == user.email:
+        raise HTTPException(422, "That's already your email address")
+    if db.scalar(select(User).where(User.email == new_email)):
+        raise HTTPException(409, "That email address is already used by another account")
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    _pending_email_changes[user.id] = (code, time.time() + OTP_TTL_SECONDS, new_email)
+    if SMTP_USERNAME:
+        # Goes to the NEW address, so only someone who can read it can finish the change.
+        background.add_task(_send_notice_email, new_email, "Confirm your new NetPulse email address",
+                            f"Your NetPulse code is {code}. It expires in 10 minutes.\n\n"
+                            "If you didn't ask to change your email address, you can ignore this email.")
+    else:
+        print(f"[email change] code for {new_email}: {code}")  # dev-mode fallback: no email provider yet
+    return {"ok": True}
+
+
+@app.post("/api/v1/me/email/confirm")
+def confirm_email_change(body: CodeBody, background: BackgroundTasks,
+                         user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rate_limit(f"me-email-confirm:{user.id}")
+    new_email = _check_pending_change(_pending_email_changes, user.id, body.code.strip())
+    if not new_email:
+        raise HTTPException(400, "Incorrect or expired code")
+    if db.scalar(select(User).where(User.email == new_email)):  # someone took it while the code was out
+        raise HTTPException(409, "That email address is already used by another account")
+    old_email = user.email
+    user.email = new_email
+    user.email_verified = True  # the code just proved they can read it
+    db.commit()
+    _queue_notices(
+        background, label="email change", email=old_email, mobiles=_linked_mobiles(db, user),
+        subject="Your NetPulse email address was changed",
+        email_text=f"The email address on your NetPulse account was just changed from {old_email} to "
+                   f"{new_email} ({_ph_time_text()}).\n\nIf this was you, no action is needed.\n"
+                   "If it wasn't, contact NetPulse support right away.",
+        sms_text="NetPulse: the email address on your account was just changed. If this wasn't you, contact support now.",
+    )
+    return {"email": new_email}
+
+
+@app.post("/api/v1/accounts/{account_id}/mobile/start")
+async def start_mobile_change(body: MobileChangeBody, a: Account = Depends(my_account),
+                              user: User = Depends(current_user)):
+    rate_limit(f"me-mobile:{user.id}")
+    _require_password(user, body.current_password)
+    new_mobile = _normalize_mobile(body.new_mobile)
+    if not new_mobile:
+        raise HTTPException(422, "Enter a valid mobile number")
+    if new_mobile == a.mobile:
+        raise HTTPException(422, "That's already the mobile number on this account")
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    if TEXTBEE_API_KEY:
+        # Texted to the NEW number, so only someone holding that phone can finish the change.
+        try:
+            await _deliver_sms_code(new_mobile, code)
+        except httpx.HTTPError as e:
+            raise HTTPException(502, f"Could not reach the SMS gateway: {e}")
+    else:
+        print(f"[mobile change] code for {new_mobile}: {code}")  # dev-mode fallback: no SMS gateway yet
+    _pending_mobile_changes[(user.id, a.id)] = (code, time.time() + OTP_TTL_SECONDS, new_mobile)
+    return {"ok": True}
+
+
+@app.post("/api/v1/accounts/{account_id}/mobile/confirm")
+def confirm_mobile_change(body: CodeBody, background: BackgroundTasks, a: Account = Depends(my_account),
+                          user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rate_limit(f"me-mobile-confirm:{user.id}")
+    new_mobile = _check_pending_change(_pending_mobile_changes, (user.id, a.id), body.code.strip())
+    if not new_mobile:
+        raise HTTPException(400, "Incorrect or expired code")
+    old_mobile = a.mobile
+    a.mobile = new_mobile
+    db.commit()
+    _queue_notices(
+        background, label="mobile change", email=user.email, mobiles=[old_mobile],  # the OLD number gets the text
+        subject="The mobile number on your NetPulse account was changed",
+        email_text=f"The mobile number registered on account {a.account_no} was just changed to {new_mobile} "
+                   f"({_ph_time_text()}).\n\nIf this was you, no action is needed.\n"
+                   "If it wasn't, contact NetPulse support right away.",
+        sms_text=f"NetPulse: the mobile number on account {a.account_no} was just changed. "
+                 "If this wasn't you, contact support now.",
+    )
+    return account_view(a, db)
+
+
+@app.post("/api/v1/me/delete")
+def delete_me(body: DeleteMeBody, background: BackgroundTasks,
+              user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Deletes this NetPulse login. The internet accounts it was linked to (bills, payments) belong to the
+    provider's records, not to the login, so they stay and can be linked again from a new sign-up."""
+    rate_limit(f"me-delete:{user.id}")
+    _require_password(user, body.current_password)
+    user_id, email = user.id, user.email
+    mobiles = _linked_mobiles(db, user)
+    for link in db.scalars(select(Link).where(Link.user_id == user_id)).all():
+        db.delete(link)
+    db.delete(user)
+    db.commit()
+    # Forget any codes still waiting for this user.
+    _pending_email_changes.pop(user_id, None)
+    for key in [k for k in _pending_mobile_changes if k[0] == user_id]:
+        _pending_mobile_changes.pop(key, None)
+    _pending_reset_otps.pop(email, None)
+    _pending_email_otps.pop(email, None)
+    _queue_notices(
+        background, label="account deletion", email=email, mobiles=mobiles,
+        subject="Your NetPulse account was deleted",
+        email_text=f"The NetPulse account for {email} was just deleted ({_ph_time_text()}). Your internet "
+                   "subscription and billing records are not affected.\n\n"
+                   "If this wasn't you, contact NetPulse support right away.",
+        sms_text="NetPulse: your account was just deleted. If this wasn't you, contact support now.",
+    )
+    return {"ok": True}
 
 
 # ---------- billing ----------

@@ -868,6 +868,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
   late final _email = TextEditingController(text: widget.initialEmail);
   final _code = TextEditingController();
   final _password = TextEditingController();
+  final _confirm = TextEditingController();
   bool _codeSent = false, _busy = false, _hide = true;
   String? _error;
 
@@ -876,6 +877,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
     _email.dispose();
     _code.dispose();
     _password.dispose();
+    _confirm.dispose();
     super.dispose();
   }
 
@@ -958,6 +960,13 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen> {
                     if (value.length < 8) return 'At least 8 characters';
                     return null;
                   },
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _confirm,
+                  obscureText: _hide,
+                  decoration: const InputDecoration(labelText: 'Confirm new password'),
+                  validator: (v) => v != _password.text ? "Passwords don't match" : null,
                 ),
                 const SizedBox(height: 4),
                 TextButton(
@@ -1477,31 +1486,136 @@ class _AddOnsScreenState extends State<AddOnsScreen> {
       );
 }
 
-class AccountPage extends StatelessWidget {
+class AccountPage extends StatefulWidget {
   final Map<String, dynamic> acct;
   final Future<void> Function() onChanged;
   const AccountPage(this.acct, this.onChanged, {super.key});
+  @override
+  State<AccountPage> createState() => _AccountPageState();
+}
 
-  Future<void> _unlink(BuildContext context) async {
-    final messenger = ScaffoldMessenger.of(context);
-    final ok = await showDialog<bool>(
+class _AccountPageState extends State<AccountPage> {
+  Map<String, dynamic> get acct => widget.acct;
+  Future<void> Function() get onChanged => widget.onChanged;
+  int _meVersion = 0; // bumped to re-fetch the email / password status after a change
+
+  /// Changing the email or mobile number, and deleting the account, all ask for the current password, and
+  /// a login made only through Google has none yet. Offers to set one (through the same emailed-code flow as
+  /// "Forgot password") and returns whether the caller can go ahead.
+  Future<bool> _hasPasswordOrOffer(Map<String, dynamic> me) async {
+    if (me['has_password'] == true) return true;
+    final setNow = await showDialog<bool>(
       context: context,
       builder: (c) => AlertDialog(
-        title: const Text('Unlink this account?'),
-        content: const Text('You can link it again later with the account number and registered mobile number.'),
+        title: const Text('Set a password first'),
+        content: const Text("This needs your password, and you signed in with Google so you don't have one yet. "
+            "Set one now: we'll email you a code, and you'll sign in again afterwards."),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Keep it')),
-          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Unlink')),
+          TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Not now')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Set password')),
         ],
       ),
     );
-    if (ok != true) return;
+    if (setNow == true && mounted) _openSetPassword(me);
+    return false;
+  }
+
+  void _openSetPassword(Map<String, dynamic> me) {
+    Navigator.of(context)
+        .push(MaterialPageRoute(builder: (_) => ForgotPasswordScreen(initialEmail: '${me['email']}')));
+  }
+
+  Future<void> _changeEmail(Map<String, dynamic> me) async {
+    if (!await _hasPasswordOrOffer(me) || !mounted) return;
+    final done = await Navigator.of(context).push<bool>(MaterialPageRoute(
+      builder: (_) => ChangeContactScreen(
+        title: 'Change email address',
+        intro: "Enter your new email address and your current password. We'll send a code to the new "
+            "address to confirm it's yours.",
+        fieldLabel: 'New email address',
+        keyboard: TextInputType.emailAddress,
+        validator: _emailValidator,
+        codeDescription: (value) => 'We sent a code to $value.',
+        start: (value, password) => api.startEmailChange(value, password),
+        confirm: (code) => api.confirmEmailChange(code),
+        successMessage: 'Email address updated.',
+      ),
+    ));
+    if (done == true && mounted) setState(() => _meVersion++);
+  }
+
+  Future<void> _changePassword(Map<String, dynamic> me) async {
+    if (me['has_password'] != true) return _openSetPassword(me); // a Google-only login: nothing to "change" yet
+    await Navigator.of(context).push<bool>(MaterialPageRoute(builder: (_) => const ChangePasswordScreen()));
+  }
+
+  Future<void> _changeMobile(Map<String, dynamic> me) async {
+    if (!await _hasPasswordOrOffer(me) || !mounted) return;
+    final accountId = acct['id'] as int;
+    final done = await Navigator.of(context).push<bool>(MaterialPageRoute(
+      builder: (_) => ChangeContactScreen(
+        title: 'Change mobile number',
+        intro: "Enter the new mobile number for account ${acct['account_no']} and your current password. "
+            "We'll text a code to the new number to confirm it's yours.",
+        fieldLabel: 'New mobile number',
+        keyboard: TextInputType.phone,
+        validator: _mobileValidator,
+        codeDescription: (value) => 'We sent a code by SMS to $value.',
+        start: (value, password) => api.startMobileChange(accountId, value, password),
+        confirm: (code) => api.confirmMobileChange(accountId, code),
+        successMessage: 'Mobile number updated.',
+      ),
+    ));
+    if (done == true) await onChanged(); // reloads the account, which rebuilds this page with the new number
+  }
+
+  Future<void> _deleteAccount() async {
+    final messenger = ScaffoldMessenger.of(context);
+    Map<String, dynamic> me;
     try {
-      await api.unlink(acct['id'] as int);
-      await onChanged();
+      me = await api.me();
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('$e')));
+      return;
     }
+    if (!mounted || !await _hasPasswordOrOffer(me) || !mounted) return;
+    final deleted = await showDialog<bool>(
+      context: context,
+      builder: (_) => _PasswordConfirmDialog(
+        title: 'Delete your account?',
+        message: "This permanently deletes your NetPulse login. Your internet subscription and billing "
+            "records aren't affected, and you can sign up again and link your account later.",
+        confirmLabel: 'Delete account',
+        busyLabel: 'Deleting...',
+        destructive: true,
+        action: api.deleteAccount,
+      ),
+    );
+    if (deleted == true) accountDeleted();
+  }
+
+  Future<void> _unlink() async {
+    final messenger = ScaffoldMessenger.of(context);
+    Map<String, dynamic> me;
+    try {
+      me = await api.me();
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('$e')));
+      return;
+    }
+    if (!mounted || !await _hasPasswordOrOffer(me) || !mounted) return;
+    final id = acct['id'] as int;
+    final done = await showDialog<bool>(
+      context: context,
+      builder: (_) => _PasswordConfirmDialog(
+        title: 'Unlink this account?',
+        message: 'You can link it again later with the account number and registered mobile number.',
+        confirmLabel: 'Unlink',
+        busyLabel: 'Unlinking...',
+        action: (pw) => api.unlink(id, pw),
+      ),
+    );
+    if (done == true) await onChanged();
   }
 
   @override
@@ -1517,15 +1631,420 @@ class AccountPage extends StatelessWidget {
           kv('Status', acct['status'] == 'ACTIVE' ? 'Active' : 'Suspended'),
         ]),
       ),
+      // Sign-in details load separately: the email and whether there's a password belong to the login, not
+      // to this internet account, so they come from their own request.
+      Loader<Map<String, dynamic>>(
+        key: ValueKey(_meVersion),
+        load: api.me,
+        builder: (c, me) {
+          final hasPassword = me['has_password'] == true;
+          return Panel(
+            child: Column(children: [
+              _editableRow(c, 'Email Address', '${me['email']}', 'Change email address', () => _changeEmail(me)),
+              const Divider(height: 1),
+              _editableRow(c, 'Password', hasPassword ? '••••••••••' : 'Not set',
+                  hasPassword ? 'Change password' : 'Set password', () => _changePassword(me)),
+              const Divider(height: 1),
+              _editableRow(c, 'Mobile Number', '${acct['mobile']}', 'Change mobile number', () => _changeMobile(me)),
+            ]),
+          );
+        },
+      ),
       OutlinedButton(
         onPressed: () => Navigator.of(context)
             .push(MaterialPageRoute(builder: (_) => ReportIssueScreen(accountId: acct['id'] as int))),
         child: const Text('Report an issue'),
       ),
       const SizedBox(height: 8),
-      OutlinedButton(onPressed: () => _unlink(context), child: const Text('Unlink this account')),
+      OutlinedButton(onPressed: _unlink, child: const Text('Unlink this account')),
+      const SizedBox(height: 8),
+      FilledButton(
+        style: _bigButton.merge(
+            FilledButton.styleFrom(backgroundColor: const Color(0xFFB42318), foregroundColor: Colors.white)),
+        onPressed: _deleteAccount,
+        child: const Text('Delete Account'),
+      ),
     ]);
   }
+}
+
+/// One line of the sign-in details panel: label on the left, the current value on the right with a small
+/// "Change ..." link under it.
+Widget _editableRow(BuildContext context, String label, String value, String linkText, VoidCallback onTap) {
+  final primary = Theme.of(context).colorScheme.primary;
+  return Padding(
+    padding: const EdgeInsets.symmetric(vertical: 10),
+    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      SizedBox(width: 108, child: Text(label)),
+      Expanded(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(value, style: const TextStyle(fontWeight: FontWeight.w600)),
+          InkWell(
+            onTap: onTap,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: Text(linkText, style: TextStyle(fontSize: 12, color: primary)),
+            ),
+          ),
+        ]),
+      ),
+    ]),
+  );
+}
+
+/// A password box with its show / hide eye, used by the change-password screen, the change-email and
+/// change-mobile screens, and the delete-account dialog.
+Widget _passwordField({
+  required TextEditingController controller,
+  required String label,
+  required bool hide,
+  required VoidCallback onToggle,
+  required String? Function(String?) validator,
+  String? helper,
+}) =>
+    TextFormField(
+      controller: controller,
+      obscureText: hide,
+      decoration: InputDecoration(
+        labelText: label,
+        helperText: helper,
+        suffixIcon: IconButton(
+          tooltip: hide ? 'Show password' : 'Hide password',
+          icon: Icon(hide ? Icons.visibility_outlined : Icons.visibility_off_outlined),
+          onPressed: onToggle,
+        ),
+      ),
+      validator: validator,
+    );
+
+String? _emailValidator(String? v) {
+  final value = v?.trim() ?? '';
+  if (value.isEmpty) return 'Enter the new email address';
+  if (!value.contains('@') || !value.contains('.')) return 'Enter a valid email';
+  return null;
+}
+
+String? _mobileValidator(String? v) {
+  final value = (v ?? '').replaceAll(RegExp(r'[\s-]'), '');
+  if (value.isEmpty) return 'Enter the new mobile number';
+  if (!RegExp(r'^\+?\d{10,13}$').hasMatch(value)) return 'Enter a valid mobile number';
+  return null;
+}
+
+/// After the NetPulse login has been deleted: back to a fresh sign-in screen.
+void accountDeleted() {
+  navigatorKey.currentState?.pushAndRemoveUntil(
+    MaterialPageRoute(builder: (_) => const LoginScreen()),
+    (r) => false,
+  );
+  messengerKey.currentState?.showSnackBar(
+    const SnackBar(content: Text('Your NetPulse account was deleted.')),
+  );
+}
+
+/// Changes an email address or a mobile number, which share the same two steps: type the new value with
+/// the current password, then enter the code sent to the NEW address / number. Pops with true when done.
+class ChangeContactScreen extends StatefulWidget {
+  final String title, intro, fieldLabel, successMessage;
+  final TextInputType keyboard;
+  final String? Function(String?) validator;
+  final String Function(String value) codeDescription;
+  final Future<void> Function(String value, String password) start;
+  final Future<void> Function(String code) confirm;
+  const ChangeContactScreen({
+    super.key,
+    required this.title,
+    required this.intro,
+    required this.fieldLabel,
+    required this.successMessage,
+    required this.keyboard,
+    required this.validator,
+    required this.codeDescription,
+    required this.start,
+    required this.confirm,
+  });
+  @override
+  State<ChangeContactScreen> createState() => _ChangeContactScreenState();
+}
+
+class _ChangeContactScreenState extends State<ChangeContactScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _value = TextEditingController();
+  final _password = TextEditingController();
+  final _code = TextEditingController();
+  bool _codeSent = false, _busy = false, _hide = true;
+  String? _error;
+
+  @override
+  void dispose() {
+    _value.dispose();
+    _password.dispose();
+    _code.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      if (!_codeSent) {
+        await widget.start(_value.text.trim(), _password.text);
+        if (mounted) setState(() => _codeSent = true); // now ask for the code that was just sent
+        return;
+      }
+      await widget.confirm(_code.text.trim());
+      if (!mounted) return;
+      messengerKey.currentState?.showSnackBar(SnackBar(content: Text(widget.successMessage)));
+      Navigator.of(context).pop(true);
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: Text(_codeSent ? 'Enter the code' : widget.title)),
+        body: SafeArea(
+          child: Form(
+            key: _formKey,
+            autovalidateMode: AutovalidateMode.onUserInteraction,
+            child: ListView(padding: const EdgeInsets.all(24), children: [
+              if (!_codeSent) ...[
+                Text(widget.intro),
+                const SizedBox(height: 20),
+                TextFormField(
+                  controller: _value,
+                  keyboardType: widget.keyboard,
+                  decoration: InputDecoration(labelText: widget.fieldLabel),
+                  validator: widget.validator,
+                ),
+                const SizedBox(height: 12),
+                _passwordField(
+                  controller: _password,
+                  label: 'Current password',
+                  hide: _hide,
+                  onToggle: () => setState(() => _hide = !_hide),
+                  validator: (v) => (v == null || v.isEmpty) ? 'Enter your current password' : null,
+                ),
+              ] else ...[
+                stepTwoDots(context),
+                CodeEntry(
+                  controller: _code,
+                  description: widget.codeDescription(_value.text.trim()),
+                  busy: _busy,
+                  onResend: () => widget.start(_value.text.trim(), _password.text),
+                  validator: (v) => (v == null || v.trim().isEmpty) ? 'Enter the code you were sent' : null,
+                ),
+                const SizedBox(height: 4),
+                TextButton(
+                  onPressed: _busy ? null : () => setState(() => _codeSent = false),
+                  child: const Text('Go back'),
+                ),
+              ],
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318))),
+                ),
+              const SizedBox(height: 20),
+              FilledButton(
+                style: _bigButton,
+                onPressed: _busy ? null : _submit,
+                child: Text(_busy ? 'Please wait...' : (_codeSent ? 'Confirm' : 'Send code')),
+              ),
+            ]),
+          ),
+        ),
+      );
+}
+
+/// Changes the password from inside the app: current password, then the new one. The server signs out
+/// the user's other devices and gives this one a fresh login, so nobody has to sign in again here.
+class ChangePasswordScreen extends StatefulWidget {
+  const ChangePasswordScreen({super.key});
+  @override
+  State<ChangePasswordScreen> createState() => _ChangePasswordScreenState();
+}
+
+class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _current = TextEditingController();
+  final _new = TextEditingController();
+  final _confirm = TextEditingController();
+  bool _busy = false, _hideCurrent = true, _hideNew = true;
+  String? _error;
+
+  @override
+  void dispose() {
+    _current.dispose();
+    _new.dispose();
+    _confirm.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await api.changePassword(_current.text, _new.text);
+      if (!mounted) return;
+      messengerKey.currentState?.showSnackBar(
+        const SnackBar(content: Text('Password changed. Your other devices were signed out.')),
+      );
+      Navigator.of(context).pop(true);
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('Change password')),
+        body: SafeArea(
+          child: Form(
+            key: _formKey,
+            autovalidateMode: AutovalidateMode.onUserInteraction,
+            child: ListView(padding: const EdgeInsets.all(24), children: [
+              _passwordField(
+                controller: _current,
+                label: 'Current password',
+                hide: _hideCurrent,
+                onToggle: () => setState(() => _hideCurrent = !_hideCurrent),
+                validator: (v) => (v == null || v.isEmpty) ? 'Enter your current password' : null,
+              ),
+              const SizedBox(height: 12),
+              _passwordField(
+                controller: _new,
+                label: 'New password',
+                helper: 'At least 8 characters',
+                hide: _hideNew,
+                onToggle: () => setState(() => _hideNew = !_hideNew),
+                validator: (v) {
+                  final value = v ?? '';
+                  if (value.isEmpty) return 'Enter a new password';
+                  if (value.length < 8) return 'At least 8 characters';
+                  if (value == _current.text) return "Choose a password that's different from your current one";
+                  return null;
+                },
+              ),
+              const SizedBox(height: 12),
+              _passwordField(
+                controller: _confirm,
+                label: 'Confirm new password',
+                hide: _hideNew,
+                onToggle: () => setState(() => _hideNew = !_hideNew),
+                validator: (v) => v != _new.text ? "Passwords don't match" : null,
+              ),
+              if (_error != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318))),
+                ),
+              const SizedBox(height: 20),
+              FilledButton(
+                style: _bigButton,
+                onPressed: _busy ? null : _submit,
+                child: Text(_busy ? 'Please wait...' : 'Change password'),
+              ),
+            ]),
+          ),
+        ),
+      );
+}
+
+/// Asks for the password one more time before something is changed or removed. [action] runs with the
+/// typed password (and throws if the server refuses it); the dialog pops true once it succeeds.
+class _PasswordConfirmDialog extends StatefulWidget {
+  final String title, message, confirmLabel, busyLabel;
+  final bool destructive;
+  final Future<void> Function(String password) action;
+  const _PasswordConfirmDialog({
+    required this.title,
+    required this.message,
+    required this.confirmLabel,
+    required this.busyLabel,
+    required this.action,
+    this.destructive = false,
+  });
+  @override
+  State<_PasswordConfirmDialog> createState() => _PasswordConfirmDialogState();
+}
+
+class _PasswordConfirmDialogState extends State<_PasswordConfirmDialog> {
+  final _password = TextEditingController();
+  bool _busy = false, _hide = true;
+  String? _error;
+
+  @override
+  void dispose() {
+    _password.dispose();
+    super.dispose();
+  }
+
+  Future<void> _confirm() async {
+    if (_password.text.isEmpty) {
+      setState(() => _error = 'Enter your password to confirm');
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.action(_password.text);
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _error = '$e';
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: Text(widget.title),
+        content: SingleChildScrollView(
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+            Text('${widget.message}\n\nEnter your password to confirm.'),
+            const SizedBox(height: 16),
+            _passwordField(
+              controller: _password,
+              label: 'Password',
+              hide: _hide,
+              onToggle: () => setState(() => _hide = !_hide),
+              validator: (_) => null,
+            ),
+            if (_error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: Text(_error!, style: const TextStyle(color: Color(0xFFB42318))),
+              ),
+          ]),
+        ),
+        actions: [
+          TextButton(onPressed: _busy ? null : () => Navigator.pop(context, false), child: const Text('Cancel')),
+          FilledButton(
+            style: widget.destructive
+                ? FilledButton.styleFrom(backgroundColor: const Color(0xFFB42318), foregroundColor: Colors.white)
+                : null,
+            onPressed: _busy ? null : _confirm,
+            child: Text(_busy ? widget.busyLabel : widget.confirmLabel),
+          ),
+        ],
+      );
 }
 
 class ReportIssueScreen extends StatefulWidget {

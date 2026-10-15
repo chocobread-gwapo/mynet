@@ -154,6 +154,46 @@ class Api {
     await _saveToken(d['token'] as String, persist: remember);
   }
 
+  // ---- the signed-in user's own details (Account tab) ----
+
+  /// {email, has_password}. has_password is false for a login made only through Google.
+  Future<Map<String, dynamic>> me() async => Map<String, dynamic>.from(await _send('GET', '/me') as Map);
+
+  /// Changing the password ends every login the user has, so the server hands back a fresh token for this
+  /// device. It's saved the same way the current login is (kept, or memory-only).
+  Future<void> changePassword(String currentPassword, String newPassword) async {
+    final d = await _send('POST', '/me/password',
+        body: {'current_password': currentPassword, 'new_password': newPassword}) as Map;
+    await _saveToken(d['token'] as String, persist: !sessionOnly);
+  }
+
+  /// Step 1 of changing the email: the server emails a code to [newEmail].
+  Future<void> startEmailChange(String newEmail, String currentPassword) async {
+    await _send('POST', '/me/email/start', body: {'new_email': newEmail, 'current_password': currentPassword});
+  }
+
+  /// Step 2: the code from the new address; the email changes.
+  Future<void> confirmEmailChange(String code) async {
+    await _send('POST', '/me/email/confirm', body: {'code': code});
+  }
+
+  /// Step 1 of changing an account's registered mobile number: the server texts a code to [newMobile].
+  Future<void> startMobileChange(int accountId, String newMobile, String currentPassword) async {
+    await _send('POST', '/accounts/$accountId/mobile/start',
+        body: {'new_mobile': newMobile, 'current_password': currentPassword});
+  }
+
+  /// Step 2: the code from the new number; the mobile number changes.
+  Future<void> confirmMobileChange(int accountId, String code) async {
+    await _send('POST', '/accounts/$accountId/mobile/confirm', body: {'code': code});
+  }
+
+  /// Deletes this NetPulse login (not the internet account), then forgets the saved login on this device.
+  Future<void> deleteAccount(String currentPassword) async {
+    await _send('POST', '/me/delete', body: {'current_password': currentPassword});
+    await clearToken();
+  }
+
   Future<List<dynamic>> accounts() async => (await _send('GET', '/accounts')) as List<dynamic>;
 
   /// Starts linking an account. Returns true if an SMS code was sent and must be confirmed with
@@ -169,8 +209,9 @@ class Api {
         body: {'account_no': accountNo, 'mobile': mobile, 'code': code});
   }
 
-  Future<void> unlink(int id) async {
-    await _send('DELETE', '/accounts/$id/link');
+  /// Removes an account from this login. Asks for the password like every other change to the user's details.
+  Future<void> unlink(int id, String currentPassword) async {
+    await _send('POST', '/accounts/$id/unlink', body: {'current_password': currentPassword});
   }
 
   Future<Map<String, dynamic>> bill(int id) async =>
