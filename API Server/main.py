@@ -1091,6 +1091,8 @@ def delete_me(body: DeleteMeBody, background: BackgroundTasks,
     mobiles = _linked_mobiles(db, user)
     for link in db.scalars(select(Link).where(Link.user_id == user_id)).all():
         db.delete(link)
+    for req in db.scalars(select(LinkRequest).where(LinkRequest.user_id == user_id)).all():
+        db.delete(req)  # the privacy policy promises these go with the login
     db.delete(user)
     db.commit()
     # Forget any codes still waiting for this user.
