@@ -191,6 +191,16 @@ class Staff(Base):  # people who work for the service provider and use the staff
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
 
 
+class StaffAction(Base):  # who did what, so every change made from the dashboard can be traced
+    __tablename__ = "staff_actions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    staff_id: Mapped[int] = mapped_column(ForeignKey("staff.id"))
+    account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"), default=None)
+    action: Mapped[str]
+    detail: Mapped[str] = mapped_column(default="")
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
+
+
 class Bill(Base):
     __tablename__ = "bills"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -211,6 +221,9 @@ class Payment(Base):
     gateway_session_id: Mapped[str | None] = mapped_column(default=None)  # PayMongo checkout session id, if real
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
     paid_at: Mapped[datetime | None] = mapped_column(default=None)
+    method: Mapped[str | None] = mapped_column(default=None)  # None = paid online; otherwise CASH | GCASH | BANK | OTHER (staff-recorded)
+    note: Mapped[str | None] = mapped_column(default=None)
+    recorded_by: Mapped[int | None] = mapped_column(ForeignKey("staff.id"), default=None)
 
 
 class Notification(Base):
@@ -230,6 +243,9 @@ class Issue(Base):
     message: Mapped[str]
     status: Mapped[str] = mapped_column(default="OPEN")  # OPEN | RESOLVED
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
+    resolved_by: Mapped[int | None] = mapped_column(ForeignKey("staff.id"), default=None)
+    resolved_at: Mapped[datetime | None] = mapped_column(default=None)
+    reply: Mapped[str | None] = mapped_column(default=None)  # staff's answer, shown to the customer
 
 
 class AddOn(Base):
@@ -274,6 +290,12 @@ def seed() -> None:
         for col, kind in (("decided_by", "INTEGER"), ("decided_at", "DATETIME"), ("reason", "VARCHAR")):
             if col not in have:
                 conn.exec_driver_sql(f"ALTER TABLE link_requests ADD COLUMN {col} {kind}")
+        for table, cols in (("payments", (("method", "VARCHAR"), ("note", "VARCHAR"), ("recorded_by", "INTEGER"))),
+                            ("issues", (("resolved_by", "INTEGER"), ("resolved_at", "DATETIME"), ("reply", "VARCHAR")))):
+            have = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
+            for col, kind in cols:
+                if col not in have:
+                    conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
     with SessionLocal() as db:
         if not db.scalar(select(AddOn)):  # separate check: added after Plan seeding already existed for some installs
             db.add_all([
@@ -1086,6 +1108,384 @@ def update_staff(staff_id: int, body: UpdateStaffBody, me: Staff = Depends(admin
     return _staff_view(s)
 
 
+# ----- customers, issues and billing (staff dashboard) -----
+# Money is whole centavos everywhere. Anything that changes money or an account's standing is admin-only and asks
+# the staff member for their password again; every change is written to staff_actions.
+MAX_MONEY = 100_000_000  # PHP 1,000,000 in centavos: a typo guard, not a business rule
+PAYMENT_METHODS = ("CASH", "GCASH", "BANK", "OTHER")
+
+
+def _audit(db: Session, staff: Staff, account_id: int | None, action: str, detail: str) -> None:
+    db.add(StaffAction(staff_id=staff.id, account_id=account_id, action=action, detail=detail[:500]))
+
+
+def _require_staff_password(staff: Staff, password: str) -> None:
+    key = f"staff-pw:{staff.id}"
+    now = time.time()  # only WRONG passwords count toward the limit, so a busy admin is never locked out
+    recent = [t for t in _rate_limit_attempts[key] if now - t < 60]
+    if len(recent) >= 5:
+        raise HTTPException(429, "Too many wrong passwords. Please wait a minute and try again.")
+    if not check_pw(password or "", staff.password_hash):
+        recent.append(now)
+        _rate_limit_attempts[key] = recent
+        raise HTTPException(403, "That password isn't right")  # 403 not 401: 401 means "signed out" to the page
+
+
+def _pesos(centavos: int) -> str:
+    return f"{CURRENCY}{centavos / 100:,.2f}"
+
+
+def _need_account(db: Session, account_id: int) -> Account:
+    acct = db.get(Account, account_id)
+    if not acct:
+        raise HTTPException(404, "Account not found")
+    return acct
+
+
+def _notify_account(db: Session, acct: Account, title: str, body: str) -> None:
+    db.add(Notification(account_id=acct.id, title=title, body=body))
+
+
+def _like(q: str) -> str:
+    return "%" + q.strip().replace("%", "").replace("_", "") + "%"
+
+
+@app.get("/api/v1/staff/summary")
+def staff_summary(_: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    """The numbers on the navigation badges."""
+    return {
+        "pending_requests": len(db.scalars(select(LinkRequest.id).where(LinkRequest.status == "PENDING")).all()),
+        "open_issues": len(db.scalars(select(Issue.id).where(Issue.status == "OPEN")).all()),
+    }
+
+
+def _account_row(a: Account, plan: Plan | None, logins: int) -> dict:
+    return {"id": a.id, "account_no": a.account_no, "holder_name": a.holder_name, "mobile": a.mobile,
+            "service_address": a.service_address, "status": a.status, "plan": plan.name if plan else None,
+            "balance": a.balance, "due_date": a.due_date.isoformat(), "linked_logins": logins}
+
+
+@app.get("/api/v1/staff/accounts")
+def staff_search_accounts(q: str = "", _: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    stmt = select(Account)
+    if q.strip():
+        like = _like(q)
+        stmt = stmt.where(Account.account_no.ilike(like) | Account.holder_name.ilike(like)
+                          | Account.mobile.ilike(like) | Account.service_address.ilike(like))
+    rows = db.scalars(stmt.order_by(Account.account_no).limit(50)).all()
+    out = []
+    for a in rows:
+        n = len(db.scalars(select(Link).where(Link.account_id == a.id)).all())
+        out.append(_account_row(a, db.get(Plan, a.plan_id), n))
+    return out
+
+
+@app.get("/api/v1/staff/users")
+def staff_search_users(q: str = "", _: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    stmt = select(User)
+    if q.strip():
+        like = _like(q)
+        stmt = stmt.where(User.email.ilike(like) | User.first_name.ilike(like) | User.last_name.ilike(like)
+                          | User.mobile.ilike(like))
+    out = []
+    for u in db.scalars(stmt.order_by(User.id.desc()).limit(50)).all():
+        accts = db.scalars(select(Account).join(Link, Link.account_id == Account.id).where(Link.user_id == u.id)).all()
+        out.append({"id": u.id, "email": u.email, "name": f"{u.first_name or ''} {u.last_name or ''}".strip(),
+                    "mobile": u.mobile, "email_verified": u.email_verified, "has_google": bool(u.google_sub),
+                    "accounts": [{"id": a.id, "account_no": a.account_no} for a in accts]})
+    return out
+
+
+@app.get("/api/v1/staff/plans")
+def staff_plans(_: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    return [{"id": p.id, "name": p.name, "speed_mbps": p.speed_mbps, "monthly_fee": p.monthly_fee}
+            for p in db.scalars(select(Plan).order_by(Plan.monthly_fee))]
+
+
+@app.get("/api/v1/staff/accounts/{account_id}")
+def staff_account_detail(account_id: int, _: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    a = _need_account(db, account_id)
+    plan = db.get(Plan, a.plan_id)
+    addons = db.scalars(select(AddOn).join(AccountAddOn, AccountAddOn.addon_id == AddOn.id)
+                        .where(AccountAddOn.account_id == a.id)).all()
+    logins = db.execute(select(User).join(Link, Link.user_id == User.id).where(Link.account_id == a.id)).scalars().all()
+    bills = db.scalars(select(Bill).where(Bill.account_id == a.id).order_by(Bill.id.desc()).limit(12)).all()
+    pays = db.scalars(select(Payment).where(Payment.account_id == a.id).order_by(Payment.id.desc()).limit(20)).all()
+    issues = db.scalars(select(Issue).where(Issue.account_id == a.id).order_by(Issue.id.desc()).limit(10)).all()
+    acts = db.execute(select(StaffAction, Staff).join(Staff, Staff.id == StaffAction.staff_id)
+                      .where(StaffAction.account_id == a.id).order_by(StaffAction.id.desc()).limit(25)).all()
+    return {
+        **_account_row(a, plan, len(logins)),
+        "plan_id": a.plan_id,
+        "plan_fee": plan.monthly_fee if plan else 0,
+        "suggested_charges": (plan.monthly_fee if plan else 0) + sum(x.monthly_fee for x in addons),
+        "addons": [{"name": x.name, "monthly_fee": x.monthly_fee} for x in addons],
+        "logins": [{"id": u.id, "email": u.email, "name": f"{u.first_name or ''} {u.last_name or ''}".strip()}
+                   for u in logins],
+        "bills": [{**bill_view(b)} for b in bills],
+        "payments": [{"id": p.id, "amount": p.amount, "status": p.status, "method": p.method or "ONLINE",
+                      "note": p.note, "created_at": _iso(p.created_at), "paid_at": _iso(p.paid_at)} for p in pays],
+        "issues": [{"id": i.id, "category": i.category, "message": i.message, "status": i.status,
+                    "created_at": _iso(i.created_at)} for i in issues],
+        "activity": [{"action": x.action, "detail": x.detail, "by": s.name, "at": _iso(x.created_at)}
+                     for x, s in acts],
+    }
+
+
+class UnlinkLoginBody(BaseModel):
+    user_id: int
+    password: str  # unlinking cuts a customer off from their bills, so it asks for the staff password like money actions do
+    reason: str | None = None
+
+
+@app.post("/api/v1/staff/accounts/{account_id}/unlink")
+def staff_unlink_login(account_id: int, body: UnlinkLoginBody, background: BackgroundTasks,
+                       staff: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    _require_staff_password(staff, body.password)
+    a = _need_account(db, account_id)
+    link = db.get(Link, (body.user_id, a.id))
+    user = db.get(User, body.user_id)
+    if not link or not user:
+        raise HTTPException(404, "That login isn't linked to this account")
+    reason = (body.reason or "").strip()[:200]
+    db.delete(link)
+    _audit(db, staff, a.id, "UNLINK_LOGIN", f"Unlinked {user.email}" + (f". Reason: {reason}" if reason else ""))
+    db.commit()
+    _queue_notices(background, label="staff unlink", email=user.email, mobiles=[],
+                   subject="An account was unlinked from your NetPulse login",
+                   email_text=f"Account {a.account_no} was unlinked from your NetPulse login by our staff."
+                              + (f" Reason: {reason}." if reason else "") + " If you think this is a mistake, please contact us.",
+                   sms_text="")
+    return staff_account_detail(account_id, staff, db)
+
+
+class MoneyAction(BaseModel):
+    password: str
+
+
+class RecordPaymentBody(MoneyAction):
+    amount: int  # centavos
+    method: str = "CASH"
+    note: str | None = None
+
+
+@app.post("/api/v1/staff/accounts/{account_id}/payments", status_code=201)
+def staff_record_payment(account_id: int, body: RecordPaymentBody, staff: Staff = Depends(admin_only),
+                         db: Session = Depends(get_db)):
+    """A payment made outside the app (at the office, by transfer). Same bookkeeping as an online one."""
+    _require_staff_password(staff, body.password)
+    a = _need_account(db, account_id)
+    if not 0 < body.amount <= MAX_MONEY:
+        raise HTTPException(422, f"Enter an amount between {_pesos(1)} and {_pesos(MAX_MONEY)}")
+    method = body.method.upper()
+    if method not in PAYMENT_METHODS:
+        raise HTTPException(422, "Choose how it was paid")
+    note = (body.note or "").strip()[:200] or None
+    now = datetime.now(timezone.utc)
+    pay = Payment(account_id=a.id, amount=body.amount, status="PAID", method=method, note=note,
+                  recorded_by=staff.id, paid_at=now)
+    db.add(pay)
+    a.balance -= body.amount
+    _notify_account(db, a, "Payment received", f"We received {_pesos(body.amount)}. Thank you!")
+    _audit(db, staff, a.id, "RECORD_PAYMENT", f"{_pesos(body.amount)} by {method}" + (f" ({note})" if note else ""))
+    db.commit()
+    return staff_account_detail(account_id, staff, db)
+
+
+class AdjustBody(MoneyAction):
+    kind: str  # CREDIT (reduces what they owe) | CHARGE (adds to what they owe)
+    amount: int
+    reason: str
+
+
+@app.post("/api/v1/staff/accounts/{account_id}/adjustments", status_code=201)
+def staff_adjust_balance(account_id: int, body: AdjustBody, staff: Staff = Depends(admin_only),
+                         db: Session = Depends(get_db)):
+    _require_staff_password(staff, body.password)
+    a = _need_account(db, account_id)
+    kind = body.kind.upper()
+    if kind not in ("CREDIT", "CHARGE"):
+        raise HTTPException(422, "Choose credit or charge")
+    if not 0 < body.amount <= MAX_MONEY:
+        raise HTTPException(422, f"Enter an amount between {_pesos(1)} and {_pesos(MAX_MONEY)}")
+    reason = body.reason.strip()[:200]
+    if len(reason) < 3:
+        raise HTTPException(422, "Please give a reason")
+    a.balance += body.amount if kind == "CHARGE" else -body.amount
+    word = "charge of" if kind == "CHARGE" else "credit of"
+    _notify_account(db, a, "Account adjustment", f"A {word} {_pesos(body.amount)} was applied to your account. Reason: {reason}")
+    _audit(db, staff, a.id, f"ADJUST_{kind}", f"{_pesos(body.amount)}. Reason: {reason}")
+    db.commit()
+    return staff_account_detail(account_id, staff, db)
+
+
+class IssueBillBody(MoneyAction):
+    charges: int
+    due_date: date
+
+
+@app.post("/api/v1/staff/accounts/{account_id}/bills", status_code=201)
+def staff_issue_bill(account_id: int, body: IssueBillBody, staff: Staff = Depends(admin_only),
+                     db: Session = Depends(get_db)):
+    _require_staff_password(staff, body.password)
+    a = _need_account(db, account_id)
+    if not 0 < body.charges <= MAX_MONEY:
+        raise HTTPException(422, f"Enter charges between {_pesos(1)} and {_pesos(MAX_MONEY)}")
+    today = date.today()
+    if body.due_date < today:
+        raise HTTPException(422, "The due date can't be in the past")
+    if db.scalar(select(Bill).where(Bill.account_id == a.id, Bill.statement_date == today)):
+        raise HTTPException(409, "A bill was already issued for this account today")
+    db.add(Bill(account_id=a.id, statement_date=today, period_start=today - timedelta(days=29), period_end=today,
+                previous_balance=a.balance, charges=body.charges))
+    a.balance += body.charges
+    a.due_date = body.due_date
+    _notify_account(db, a, "New bill", f"Your new bill is {_pesos(body.charges)}, due {body.due_date:%b %d, %Y}.")
+    _audit(db, staff, a.id, "ISSUE_BILL", f"Charges {_pesos(body.charges)}, due {body.due_date.isoformat()}")
+    db.commit()
+    return staff_account_detail(account_id, staff, db)
+
+
+class ChangePlanBody(MoneyAction):
+    plan_id: int
+
+
+@app.post("/api/v1/staff/accounts/{account_id}/plan")
+def staff_change_plan(account_id: int, body: ChangePlanBody, staff: Staff = Depends(admin_only),
+                      db: Session = Depends(get_db)):
+    _require_staff_password(staff, body.password)
+    a = _need_account(db, account_id)
+    new = db.get(Plan, body.plan_id)
+    if not new:
+        raise HTTPException(404, "Plan not found")
+    old = db.get(Plan, a.plan_id)
+    if old and old.id == new.id:
+        raise HTTPException(409, "That is already their plan")
+    a.plan_id = new.id
+    _notify_account(db, a, "Plan changed", f"Your plan is now {new.name} ({new.speed_mbps} Mbps).")
+    _audit(db, staff, a.id, "CHANGE_PLAN", f"{old.name if old else '?'} to {new.name}")
+    db.commit()
+    return staff_account_detail(account_id, staff, db)
+
+
+class SetStatusBody(MoneyAction):
+    status: str
+    reason: str | None = None
+
+
+@app.post("/api/v1/staff/accounts/{account_id}/status")
+def staff_set_status(account_id: int, body: SetStatusBody, staff: Staff = Depends(admin_only),
+                     db: Session = Depends(get_db)):
+    _require_staff_password(staff, body.password)
+    a = _need_account(db, account_id)
+    status = body.status.upper()
+    if status not in ("ACTIVE", "SUSPENDED"):
+        raise HTTPException(422, "Status must be ACTIVE or SUSPENDED")
+    if a.status == status:
+        raise HTTPException(409, f"The account is already {status.lower()}")
+    reason = (body.reason or "").strip()[:200]
+    a.status = status
+    _notify_account(db, a, "Service suspended" if status == "SUSPENDED" else "Service restored",
+                    ("Your service was suspended." if status == "SUSPENDED" else "Your service is active again.")
+                    + (f" Reason: {reason}" if reason else ""))
+    _audit(db, staff, a.id, "SUSPEND" if status == "SUSPENDED" else "REACTIVATE", reason or "")
+    db.commit()
+    return staff_account_detail(account_id, staff, db)
+
+
+class ContactBody(MoneyAction):
+    holder_name: str
+    mobile: str
+    service_address: str
+
+
+@app.post("/api/v1/staff/accounts/{account_id}/contact")
+def staff_edit_contact(account_id: int, body: ContactBody, staff: Staff = Depends(admin_only),
+                       db: Session = Depends(get_db)):
+    """The number here is where verification codes go, so changing it asks for the staff password."""
+    _require_staff_password(staff, body.password)
+    a = _need_account(db, account_id)
+    name, address = body.holder_name.strip()[:120], body.service_address.strip()[:200]
+    mobile = _normalize_mobile(body.mobile)
+    if not name or not address:
+        raise HTTPException(422, "Name and address can't be empty")
+    if not mobile:
+        raise HTTPException(422, "Enter a valid mobile number")
+    changes = [f"{label}: {old} to {new}" for label, old, new in
+               (("name", a.holder_name, name), ("mobile", a.mobile, mobile), ("address", a.service_address, address))
+               if old != new]
+    if not changes:
+        raise HTTPException(409, "Nothing was changed")
+    a.holder_name, a.mobile, a.service_address = name, mobile, address
+    _audit(db, staff, a.id, "EDIT_CONTACT", "; ".join(changes))
+    db.commit()
+    return staff_account_detail(account_id, staff, db)
+
+
+# ----- issue inbox -----
+def _issue_view(i: Issue, a: Account, db: Session) -> dict:
+    resolver = db.get(Staff, i.resolved_by) if i.resolved_by else None
+    logins = db.scalars(select(User).join(Link, Link.user_id == User.id).where(Link.account_id == a.id)).all()
+    return {"id": i.id, "category": i.category, "message": i.message, "status": i.status,
+            "created_at": _iso(i.created_at), "resolved_at": _iso(i.resolved_at),
+            "resolved_by": resolver.name if resolver else None, "reply": i.reply,
+            "account": {"id": a.id, "account_no": a.account_no, "holder_name": a.holder_name, "mobile": a.mobile},
+            "logins": [u.email for u in logins]}
+
+
+@app.get("/api/v1/staff/issues")
+def staff_list_issues(status: str = "OPEN", _: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    status = status.upper()
+    if status not in ("OPEN", "RESOLVED"):
+        raise HTTPException(422, "status must be OPEN or RESOLVED")
+    counts = {st: len(db.scalars(select(Issue.id).where(Issue.status == st)).all()) for st in ("OPEN", "RESOLVED")}
+    order = Issue.id if status == "OPEN" else Issue.id.desc()  # open: oldest first; history: newest first
+    rows = db.execute(select(Issue, Account).join(Account, Account.id == Issue.account_id)
+                      .where(Issue.status == status).order_by(order).limit(200)).all()
+    return {"counts": counts, "items": [_issue_view(i, a, db) for i, a in rows]}
+
+
+class ResolveBody(BaseModel):
+    reply: str | None = None
+
+
+@app.post("/api/v1/staff/issues/{issue_id}/resolve")
+def staff_resolve_issue(issue_id: int, body: ResolveBody, background: BackgroundTasks,
+                        staff: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    issue = db.get(Issue, issue_id)
+    if not issue:
+        raise HTTPException(404, "Issue not found")
+    if issue.status != "OPEN":
+        raise HTTPException(409, "This issue is already resolved")
+    a = db.get(Account, issue.account_id)
+    reply = (body.reply or "").strip()[:500] or None
+    issue.status, issue.resolved_by, issue.resolved_at, issue.reply = "RESOLVED", staff.id, datetime.now(timezone.utc), reply
+    _notify_account(db, a, "Your report was resolved",
+                    f"We looked at your {issue.category.lower()} report." + (f" {reply}" if reply else " It is marked as resolved."))
+    _audit(db, staff, a.id, "RESOLVE_ISSUE", f"#{issue.id} ({issue.category})" + (f": {reply}" if reply else ""))
+    db.commit()
+    for u in db.scalars(select(User).join(Link, Link.user_id == User.id).where(Link.account_id == a.id)).all():
+        _queue_notices(background, label="issue resolved", email=u.email, mobiles=[],
+                       subject="Your NetPulse report was resolved",
+                       email_text=f"Your {issue.category.lower()} report for account {a.account_no} was resolved."
+                                  + (f"\n\nOur reply: {reply}" if reply else ""), sms_text="")
+    return _issue_view(issue, a, db)
+
+
+@app.post("/api/v1/staff/issues/{issue_id}/reopen")
+def staff_reopen_issue(issue_id: int, staff: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    issue = db.get(Issue, issue_id)
+    if not issue:
+        raise HTTPException(404, "Issue not found")
+    if issue.status != "RESOLVED":
+        raise HTTPException(409, "This issue is already open")
+    a = db.get(Account, issue.account_id)
+    issue.status, issue.resolved_by, issue.resolved_at = "OPEN", None, None
+    _audit(db, staff, a.id, "REOPEN_ISSUE", f"#{issue.id}")
+    db.commit()
+    return _issue_view(issue, a, db)
+
+
 # ----- the dashboard page itself -----
 STAFF_PORTAL_DIR = _BASE_DIR / "staff_portal"
 
@@ -1666,7 +2066,7 @@ def report_issue(body: IssueBody, a: Account = Depends(my_account), db: Session 
 def list_issues(a: Account = Depends(my_account), db: Session = Depends(get_db)):
     rows = db.scalars(select(Issue).where(Issue.account_id == a.id).order_by(Issue.created_at.desc()))
     return [{"id": i.id, "category": i.category, "message": i.message, "status": i.status,
-             "created_at": i.created_at.isoformat()} for i in rows]
+             "reply": i.reply, "created_at": i.created_at.isoformat()} for i in rows]
 
 
 # ---------- add-ons ----------

@@ -175,3 +175,62 @@ tr:last-child td { border-bottom: 0; }
   .nav { order: 3; width: 100%; display: flex; flex-wrap: nowrap; gap: 4px; overflow-x: auto; }
   .nav button { white-space: nowrap; }
 }
+
+/* ---------- customers, issues, billing ---------- */
+.search { margin-bottom: 14px; }
+.search input { width: 100%; }
+tr.click { cursor: pointer; }
+tr.click:hover td { background: var(--surface-2); }
+.link-btn { border: 0; background: none; padding: 0; font: inherit; font-weight: 700; color: var(--brand); cursor: pointer; text-decoration: underline; }
+.span2 { grid-column: 1 / -1; }
+.action-panel { max-width: 640px; }
+.preview { grid-column: 1 / -1; margin: 8px 0 0; font-weight: 600; min-height: 1.2em; }
+.card h3 { margin-bottom: 10px; }
+.login-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.login-row:last-child { border-bottom: 0; }
+.table-wrap.flat { border: 0; border-radius: 0; background: none; }
+table.compact { min-width: 480px; }
+table.compact th, table.compact td { padding: 8px 10px; }
+.message { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface-2); border-radius: 12px; padding: 12px 14px; margin: 0 0 14px; }
+.chips.flush { margin: 0; }
+.page-title .inline input { width: auto; }
+
+@media (max-width: 640px) {
+  table.compact { min-width: 0; }
+  table.compact th, table.compact td { padding: 6px 6px; font-size: 13px; overflow-wrap: anywhere; }
+  .table-wrap.flat { overflow-x: visible; }
+}
+
+/* tidy action forms: no reserved blank line for the preview, even spacing between fields */
+.preview { min-height: 0; margin: 4px 0 0; }
+.preview:empty { display: none; }
+.action-panel .form-grid { row-gap: 12px; margin-bottom: 14px; }
+.action-panel label { margin-top: 0; }
+.action-panel p.flush { margin: 0 0 12px; }
+
+/* the new-balance preview lives on the label line, so typing never moves the form */
+.label-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.label-row label { margin-bottom: 6px; }
+.label-row .preview { grid-column: auto; margin: 0; font-size: 13px; font-weight: 600; color: var(--brand); white-space: nowrap; }
+.label-row .preview:empty { display: block; }
+
+/* the action form lives inside the Actions card, under the buttons, instead of floating as a second card */
+.card .action-panel { background: none; border: 0; border-top: 1px solid var(--line); border-radius: 0; box-shadow: none; padding: 16px 0 0; margin: 16px 0 0; max-width: 640px; }
+.card .action-panel h3 { margin-bottom: 4px; }
+
+/* Actions card: everything centred; the field labels stay left-aligned so the form is still easy to read */
+.actions-card > h3 { text-align: center; }
+.actions-card > .actions { justify-content: center; }
+.actions-card > .muted { text-align: center; }
+.card.actions-card .action-panel { margin: 16px auto 0; }
+.actions-card .action-panel > h3, .actions-card .action-panel > p { text-align: center; }
+.actions-card .action-panel > .actions { justify-content: center; }
+
+/* password pop-up */
+.modal-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 16px; background: rgba(0, 0, 0, .55); }
+.modal { width: min(420px, 100%); max-height: 100%; overflow-y: auto; background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: 0 20px 60px rgba(0, 0, 0, .35); padding: 20px; }
+.modal h3 { font-size: 17px; margin: 0 0 8px; }
+.modal-detail { margin: 0 0 6px; padding: 10px 12px; background: var(--surface-2); border-radius: 10px; font-weight: 600; overflow-wrap: anywhere; }
+.modal .hint { margin: 8px 0 0; }
+.modal .error { margin-top: 12px; }
+.modal-actions { justify-content: flex-end; }

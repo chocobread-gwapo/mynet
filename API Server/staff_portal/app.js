@@ -9,7 +9,11 @@ const app = document.getElementById('app');
 const state = {
   token: null,
   staff: null,
-  view: 'requests', // requests | staff | account
+  view: 'requests', // requests | customers | issues | staff | account
+  summary: { pending_requests: 0, open_issues: 0 },
+  q: '', searchKind: 'accounts', results: [], searched: false, // customers
+  accountId: null, account: null, action: null, plans: [], // one customer's page, and which action panel is open
+  issueFilter: 'OPEN', issues: { counts: { OPEN: 0, RESOLVED: 0 }, items: [] }, issueOpen: null,
   filter: 'PENDING',
   requests: { counts: { PENDING: 0, APPROVED: 0, REJECTED: 0 }, items: [] },
   staffList: [],
@@ -116,6 +120,7 @@ function renderLogin() {
         state.view = 'requests';
         render();
         loadRequests(true);
+        loadSummary();
       } catch (err) {
         error.textContent = err.message;
         error.classList.remove('hidden');
@@ -138,14 +143,27 @@ function renderLogin() {
 }
 
 // ---------- shell ----------
+function go(view) {
+  state.view = view;
+  state.open = null; state.action = null; state.issueOpen = null;
+  if (view === 'customers') { state.accountId = null; state.account = null; }
+  render();
+  if (view === 'requests') loadRequests(true);
+  if (view === 'issues') loadIssues(true);
+  if (view === 'staff') loadStaff();
+  loadSummary();
+}
+
 function renderShell(content) {
-  const pending = state.requests.counts.PENDING;
+  const badge = (key) => h('span', { class: `badge${state.summary[key] ? '' : ' hidden'}`, 'data-badge': key }, state.summary[key]);
   const tab = (view, label, extra) => h('button', {
     class: state.view === view ? 'active' : '',
-    onclick: () => { state.view = view; state.open = null; render(); },
+    onclick: () => go(view),
   }, label, extra);
   const nav = h('nav', { class: 'nav' },
-    tab('requests', 'Link requests', pending ? h('span', { class: 'badge' }, pending) : null),
+    tab('requests', 'Link requests', badge('pending_requests')),
+    tab('customers', 'Customers'),
+    tab('issues', 'Issues', badge('open_issues')),
     state.staff.role === 'admin' ? tab('staff', 'Staff') : null,
     tab('account', 'My account'));
   const top = h('header', { class: 'topbar' }, h('div', { class: 'topbar-inner' },
@@ -167,15 +185,22 @@ async function loadRequests(quiet) {
     state.error = err.message;
     if (!quiet) toast(err.message);
   }
+  state.summary.pending_requests = state.requests.counts.PENDING;
+  // A refresh while someone is half-way through confirming a decision must not wipe their form: only the badges update.
   if (state.view === 'requests' && !state.open) render();
-  else if (state.view === 'requests') renderBadgeOnly();
+  else updateBadges();
 }
 
-// A refresh while someone is half-way through confirming a decision must not wipe their form: only the badge updates.
-function renderBadgeOnly() {
-  const badge = document.querySelector('.nav .badge');
-  const n = state.requests.counts.PENDING;
-  if (badge) badge.textContent = n;
+function updateBadges() {
+  for (const el of document.querySelectorAll('[data-badge]')) {
+    const n = state.summary[el.dataset.badge] || 0;
+    el.textContent = n;
+    el.classList.toggle('hidden', !n);
+  }
+}
+
+async function loadSummary() {
+  try { state.summary = await api('/summary'); updateBadges(); } catch { /* the badges just stay as they were */ }
 }
 
 function chip(kind, text) { return h('span', { class: `chip ${kind}` }, text); }
@@ -356,7 +381,8 @@ function viewAccount() {
 function render() {
   if (!state.token) return renderLogin();
   const view = state.view === 'staff' && state.staff.role !== 'admin' ? 'requests' : state.view;
-  renderShell(view === 'requests' ? viewRequests() : view === 'staff' ? viewStaff() : viewAccount());
+  const views = { requests: viewRequests, customers: viewCustomers, issues: viewIssues, staff: viewStaff, account: viewAccount };
+  renderShell((views[view] || viewRequests)());
 }
 
 async function start() {
@@ -365,24 +391,15 @@ async function start() {
     try { state.staff = await api('/me'); } catch { state.token = null; }
   }
   render();
-  if (state.token) { loadRequests(true); }
+  if (state.token) { loadRequests(true); loadSummary(); }
 }
 
-// New requests show up on their own while the queue is on screen.
+// New requests and reports show up on their own while their queue is on screen.
 setInterval(() => {
-  if (state.token && !document.hidden) {
-    if (state.view === 'requests') loadRequests(true);
-  }
+  if (!state.token || document.hidden) return;
+  loadSummary();
+  if (state.view === 'requests') loadRequests(true);
+  if (state.view === 'issues' && !state.issueOpen) loadIssues(true);
 }, 30000);
-
-// Opening a tab also fetches what that tab needs.
-document.addEventListener('click', (e) => {
-  const btn = e.target.closest && e.target.closest('.nav button');
-  if (!btn) return;
-  queueMicrotask(() => {
-    if (state.view === 'staff') loadStaff();
-    if (state.view === 'requests') loadRequests(true);
-  });
-});
 
 start();
