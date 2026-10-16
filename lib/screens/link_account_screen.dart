@@ -93,8 +93,11 @@ class _LinkAccountScreenState extends State<LinkAccountScreen> {
                       const Icon(Icons.info_outline, color: Color(0xFFB42318)),
                       const SizedBox(width: 12),
                       Expanded(
-                        child: Text("Your request to link account ${r['account_no']} was declined. If you think "
-                            'that was a mistake, please contact us. You can check the number and send a new request below.'),
+                        child: Text(
+                          "Your request to link account ${r['account_no']} was declined."
+                          "${(r['reason'] as String?)?.trim().isNotEmpty == true ? ' Reason: ${r['reason']}.' : ''} "
+                          'If you think that was a mistake, please contact us. You can check the number and send a new request below.',
+                        ),
                       ),
                       IconButton(
                         tooltip: 'Dismiss',

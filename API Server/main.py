@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import smtplib
 import time
@@ -173,6 +174,21 @@ class LinkRequest(Base):  # a user asking to be linked to an account; approved b
     account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
     status: Mapped[str] = mapped_column(default="PENDING")  # PENDING | APPROVED | REJECTED
     created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
+    # Filled in when staff decide it (see the staff section further down).
+    decided_by: Mapped[int | None] = mapped_column(ForeignKey("staff.id"), default=None)
+    decided_at: Mapped[datetime | None] = mapped_column(default=None)
+    reason: Mapped[str | None] = mapped_column(default=None)  # why it was declined, shown to the customer
+
+
+class Staff(Base):  # people who work for the service provider and use the staff dashboard
+    __tablename__ = "staff"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String, unique=True)
+    name: Mapped[str]
+    password_hash: Mapped[str]
+    role: Mapped[str] = mapped_column(default="support")  # admin | support
+    active: Mapped[bool] = mapped_column(default=True)
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
 
 
 class Bill(Base):
@@ -254,6 +270,10 @@ def seed() -> None:
         for col in ("first_name", "last_name", "mobile"):
             if col not in have:
                 conn.exec_driver_sql(f"ALTER TABLE users ADD COLUMN {col} VARCHAR")
+        have = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(link_requests)")}
+        for col, kind in (("decided_by", "INTEGER"), ("decided_at", "DATETIME"), ("reason", "VARCHAR")):
+            if col not in have:
+                conn.exec_driver_sql(f"ALTER TABLE link_requests ADD COLUMN {col} {kind}")
     with SessionLocal() as db:
         if not db.scalar(select(AddOn)):  # separate check: added after Plan seeding already existed for some installs
             db.add_all([
@@ -335,6 +355,8 @@ def current_user(creds: HTTPAuthorizationCredentials = Depends(bearer), db: Sess
         payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
         user_id = int(payload["sub"])
     except (jwt.PyJWTError, KeyError, ValueError):
+        raise HTTPException(401, "Invalid or expired token")
+    if payload.get("typ") == "staff":  # a staff login is not a customer login
         raise HTTPException(401, "Invalid or expired token")
     user = db.get(User, user_id)
     if not user:
@@ -801,8 +823,8 @@ def my_link_requests(user: User = Depends(current_user), db: Session = Depends(g
     rows = db.execute(select(LinkRequest, Account).join(Account, Account.id == LinkRequest.account_id)
                       .where(LinkRequest.user_id == user.id, LinkRequest.status.in_(("PENDING", "REJECTED")))
                       .order_by(LinkRequest.id)).all()
-    return [{"id": r.id, "account_no": a.account_no, "status": r.status, "created_at": r.created_at.isoformat()}
-            for r, a in rows]
+    return [{"id": r.id, "account_no": a.account_no, "status": r.status, "created_at": r.created_at.isoformat(),
+             "reason": r.reason} for r, a in rows]
 
 
 @app.post("/api/v1/accounts/link/requests/{request_id}/dismiss", status_code=204)
@@ -814,59 +836,276 @@ def dismiss_link_request(request_id: int, user: User = Depends(current_user), db
         db.commit()
 
 
-# ---------- admin: approving link requests ----------
-def require_admin(request: Request, x_admin_key: str | None = Header(default=None)) -> None:
-    """Whoever runs the service approves link requests. With NETPULSE_ADMIN_KEY set (do this anywhere the
-    server is reachable by others) the X-Admin-Key header must match it; without it, only requests from
-    the server's own machine are allowed, e.g. the http://localhost:8000/docs page while developing."""
-    key = os.getenv("NETPULSE_ADMIN_KEY")
-    if key:
-        if not x_admin_key or not hmac.compare_digest(x_admin_key, key):
-            raise HTTPException(403, "Admin key required")
-    elif not request.client or request.client.host not in ("127.0.0.1", "::1", "localhost"):
-        raise HTTPException(403, "Admin routes are only available from the server itself unless NETPULSE_ADMIN_KEY is set")
+# ---------- staff: the provider's side (web dashboard + its API) ----------
+# Staff are separate from customers: their own table, their own login, and tokens that carry typ="staff" so a
+# customer's token never works here and a staff token never works in the customer app. The dashboard itself is
+# the static page in the staff_portal folder, served at /staff/.
+STAFF_TOKEN_HOURS = 12
+STAFF_ROLES = ("admin", "support")  # admin: everything, including managing staff; support: day-to-day requests
 
 
-@app.get("/api/v1/admin/link-requests", dependencies=[Depends(require_admin)])
-def admin_list_link_requests(db: Session = Depends(get_db)):
-    rows = db.execute(select(LinkRequest, Account, User).join(Account, Account.id == LinkRequest.account_id)
-                      .join(User, User.id == LinkRequest.user_id)
-                      .where(LinkRequest.status == "PENDING").order_by(LinkRequest.id)).all()
-    return [{"id": r.id, "requested_at": r.created_at.isoformat(), "user_email": u.email,
-             "user_name": f"{u.first_name or ''} {u.last_name or ''}".strip(), "user_mobile": u.mobile,
-             "account_no": a.account_no, "account_holder": a.holder_name, "account_mobile": a.mobile}
-            for r, a, u in rows]
+def _iso(dt: datetime | None) -> str | None:
+    """Timestamps are stored as UTC without a zone; send them with a Z so browsers convert correctly."""
+    if dt is None:
+        return None
+    return dt.isoformat() + ("Z" if dt.tzinfo is None else "")
 
 
-def _decide_link_request(request_id: int, approve: bool, background: BackgroundTasks, db: Session) -> dict:
+def _staff_pw_version(staff: Staff) -> str:
+    return hashlib.sha256(staff.password_hash.encode()).hexdigest()[:16]
+
+
+def make_staff_token(staff: Staff) -> str:
+    exp = datetime.now(timezone.utc) + timedelta(hours=STAFF_TOKEN_HOURS)
+    return jwt.encode({"sub": str(staff.id), "typ": "staff", "exp": exp, "pv": _staff_pw_version(staff)},
+                      JWT_SECRET, algorithm="HS256")
+
+
+def current_staff(creds: HTTPAuthorizationCredentials = Depends(bearer), db: Session = Depends(get_db)) -> Staff:
+    try:
+        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
+        staff_id = int(payload["sub"])
+    except (jwt.PyJWTError, KeyError, ValueError):
+        raise HTTPException(401, "Invalid or expired token")
+    if payload.get("typ") != "staff":
+        raise HTTPException(401, "Invalid or expired token")
+    staff = db.get(Staff, staff_id)
+    if not staff or not staff.active or payload.get("pv") != _staff_pw_version(staff):
+        raise HTTPException(401, "Invalid or expired token")
+    return staff
+
+
+def admin_only(staff: Staff = Depends(current_staff)) -> Staff:
+    if staff.role != "admin":
+        raise HTTPException(403, "Only an admin can do this")
+    return staff
+
+
+def _staff_view(s: Staff) -> dict:
+    return {"id": s.id, "email": s.email, "name": s.name, "role": s.role, "active": s.active,
+            "created_at": _iso(s.created_at)}
+
+
+def _staff_password_problem(pw: str) -> str | None:
+    if len(pw) < 10:
+        return "Staff passwords must be at least 10 characters"
+    return _password_problem(pw)
+
+
+class StaffLoginBody(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/api/v1/staff/login")
+def staff_login(body: StaffLoginBody, request: Request, db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    rate_limit(f"staff-login:{email}")
+    rate_limit(f"staff-login-ip:{request.client.host if request.client else '?'}", max_attempts=20)
+    staff = db.scalar(select(Staff).where(Staff.email == email))
+    # The same answer for an unknown email, a wrong password and a deactivated person.
+    if not staff or not staff.active or not check_pw(body.password, staff.password_hash):
+        raise HTTPException(401, "Wrong email or password")
+    return {"token": make_staff_token(staff), "staff": _staff_view(staff)}
+
+
+@app.get("/api/v1/staff/me")
+def staff_me(staff: Staff = Depends(current_staff)):
+    return _staff_view(staff)
+
+
+class StaffPasswordBody(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post("/api/v1/staff/me/password")
+def staff_change_password(body: StaffPasswordBody, staff: Staff = Depends(current_staff),
+                          db: Session = Depends(get_db)):
+    rate_limit(f"staff-pw:{staff.id}")
+    if not check_pw(body.current_password, staff.password_hash):
+        raise HTTPException(403, "Your current password is wrong")  # 403, never 401: the dashboard treats 401 as "signed out"
+    problem = _staff_password_problem(body.new_password)
+    if problem:
+        raise HTTPException(422, problem)
+    staff.password_hash = hash_pw(body.new_password)
+    db.commit()
+    return {"token": make_staff_token(staff)}  # the old token stopped working with the old password
+
+
+# ----- link requests -----
+def _name_tokens(text: str) -> set[str]:
+    return set(re.findall(r"[a-z]+", (text or "").lower()))
+
+
+def _link_request_view(req: LinkRequest, user: User, acct: Account, plan: Plan | None, db: Session) -> dict:
+    holder = _name_tokens(acct.holder_name)
+    first, last = _name_tokens(user.first_name or ""), _name_tokens(user.last_name or "")
+    user_mobile = _normalize_mobile(user.mobile or "") if user.mobile else None
+    acct_mobile = _normalize_mobile(acct.mobile or "")
+    decided_by = db.get(Staff, req.decided_by) if req.decided_by else None
+    return {
+        "id": req.id,
+        "status": req.status,
+        "requested_at": _iso(req.created_at),
+        "decided_at": _iso(req.decided_at),
+        "decided_by": decided_by.name if decided_by else None,
+        "reason": req.reason,
+        "requester": {"email": user.email, "name": f"{user.first_name or ''} {user.last_name or ''}".strip(),
+                      "mobile": user.mobile},
+        "account": {"account_no": acct.account_no, "holder_name": acct.holder_name, "mobile": acct.mobile,
+                    "service_address": acct.service_address, "status": acct.status,
+                    "plan": plan.name if plan else None},
+        # Quick checks to help staff decide; they are hints, not proof.
+        "signals": {
+            "mobile_match": bool(user_mobile and acct_mobile and user_mobile == acct_mobile),
+            "name_match": bool(first and last and first & holder and last & holder),
+            "already_linked_logins": len(db.scalars(select(Link).where(Link.account_id == acct.id)).all()),
+            "other_pending_for_account": len(db.scalars(select(LinkRequest).where(
+                LinkRequest.account_id == acct.id, LinkRequest.status == "PENDING", LinkRequest.id != req.id)).all()),
+        },
+    }
+
+
+@app.get("/api/v1/staff/link-requests")
+def staff_list_link_requests(status: str = "PENDING", staff: Staff = Depends(current_staff),
+                             db: Session = Depends(get_db)):
+    status = status.upper()
+    if status not in ("PENDING", "APPROVED", "REJECTED"):
+        raise HTTPException(422, "status must be PENDING, APPROVED or REJECTED")
+    counts = {st: len(db.scalars(select(LinkRequest.id).where(LinkRequest.status == st)).all())
+              for st in ("PENDING", "APPROVED", "REJECTED")}
+    # The pending queue is oldest first (first come, first served); the history is newest first.
+    order = LinkRequest.id if status == "PENDING" else LinkRequest.id.desc()
+    rows = db.execute(select(LinkRequest, User, Account).join(User, User.id == LinkRequest.user_id)
+                      .join(Account, Account.id == LinkRequest.account_id)
+                      .where(LinkRequest.status == status).order_by(order).limit(200)).all()
+    return {"counts": counts,
+            "items": [_link_request_view(r, u, a, db.get(Plan, a.plan_id), db) for r, u, a in rows]}
+
+
+class DecisionBody(BaseModel):
+    reason: str | None = None
+
+
+def _decide_link_request(request_id: int, approve: bool, reason: str | None, staff: Staff,
+                         background: BackgroundTasks, db: Session) -> dict:
     req = db.get(LinkRequest, request_id)
     if not req:
         raise HTTPException(404, "Request not found")
     if req.status != "PENDING":
-        raise HTTPException(409, f"Already {req.status.lower()}")
+        raise HTTPException(409, f"This request was already {req.status.lower()}")
     user, acct = db.get(User, req.user_id), db.get(Account, req.account_id)
+    reason = (reason or "").strip()[:200] or None
     if approve:
         _complete_link(db, user, acct)
     req.status = "APPROVED" if approve else "REJECTED"
+    req.decided_by, req.decided_at = staff.id, datetime.now(timezone.utc)
+    req.reason = None if approve else reason
     db.commit()
     verdict = "approved" if approve else "declined"
-    _queue_notices(
-        background, label=f"link {verdict}", email=user.email, mobiles=[],
-        subject=f"Your NetPulse link request was {verdict}",
-        email_text=(f"Your request to link account {acct.account_no} to NetPulse was {verdict}."
-                    + (" Open the app to see it." if approve else " If you think this is a mistake, please contact us.")),
-        sms_text="")
-    return {"id": req.id, "status": req.status}
+    text = f"Your request to link account {acct.account_no} to NetPulse was {verdict}."
+    if approve:
+        text += " Open the app to see it."
+    else:
+        text += (f" Reason: {reason}." if reason else "") + " If you think this is a mistake, please contact us."
+    _queue_notices(background, label=f"link {verdict}", email=user.email, mobiles=[],
+                   subject=f"Your NetPulse link request was {verdict}", email_text=text, sms_text="")
+    return _link_request_view(req, user, acct, db.get(Plan, acct.plan_id), db)
 
 
-@app.post("/api/v1/admin/link-requests/{request_id}/approve", dependencies=[Depends(require_admin)])
-def admin_approve_link(request_id: int, background: BackgroundTasks, db: Session = Depends(get_db)):
-    return _decide_link_request(request_id, True, background, db)
+@app.post("/api/v1/staff/link-requests/{request_id}/approve")
+def staff_approve_link(request_id: int, background: BackgroundTasks, staff: Staff = Depends(current_staff),
+                       db: Session = Depends(get_db)):
+    return _decide_link_request(request_id, True, None, staff, background, db)
 
 
-@app.post("/api/v1/admin/link-requests/{request_id}/reject", dependencies=[Depends(require_admin)])
-def admin_reject_link(request_id: int, background: BackgroundTasks, db: Session = Depends(get_db)):
-    return _decide_link_request(request_id, False, background, db)
+@app.post("/api/v1/staff/link-requests/{request_id}/reject")
+def staff_reject_link(request_id: int, body: DecisionBody, background: BackgroundTasks,
+                      staff: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    return _decide_link_request(request_id, False, body.reason, staff, background, db)
+
+
+# ----- managing staff (admins only) -----
+class NewStaffBody(BaseModel):
+    email: str
+    name: str
+    role: str = "support"
+    password: str
+
+
+class UpdateStaffBody(BaseModel):
+    role: str | None = None
+    active: bool | None = None
+    new_password: str | None = None
+
+
+@app.get("/api/v1/staff/staff")
+def list_staff(_: Staff = Depends(admin_only), db: Session = Depends(get_db)):
+    return [_staff_view(s) for s in db.scalars(select(Staff).order_by(Staff.id))]
+
+
+@app.post("/api/v1/staff/staff", status_code=201)
+def create_staff(body: NewStaffBody, _: Staff = Depends(admin_only), db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    if "@" not in email or not body.name.strip():
+        raise HTTPException(422, "Enter a name and a valid email")
+    if body.role not in STAFF_ROLES:
+        raise HTTPException(422, "Role must be admin or support")
+    problem = _staff_password_problem(body.password)
+    if problem:
+        raise HTTPException(422, problem)
+    if db.scalar(select(Staff).where(Staff.email == email)):
+        raise HTTPException(409, "A staff member with that email already exists")
+    s = Staff(email=email, name=body.name.strip(), role=body.role, password_hash=hash_pw(body.password))
+    db.add(s)
+    db.commit()
+    return _staff_view(s)
+
+
+@app.post("/api/v1/staff/staff/{staff_id}/update")
+def update_staff(staff_id: int, body: UpdateStaffBody, me: Staff = Depends(admin_only),
+                 db: Session = Depends(get_db)):
+    s = db.get(Staff, staff_id)
+    if not s:
+        raise HTTPException(404, "Staff member not found")
+    if body.role is not None and body.role not in STAFF_ROLES:
+        raise HTTPException(422, "Role must be admin or support")
+    if s.id == me.id and ((body.role and body.role != "admin") or body.active is False):
+        raise HTTPException(409, "You can't demote or deactivate yourself")
+    if body.new_password is not None:
+        problem = _staff_password_problem(body.new_password)
+        if problem:
+            raise HTTPException(422, problem)
+        s.password_hash = hash_pw(body.new_password)  # signs that person out everywhere
+    if body.role is not None:
+        s.role = body.role
+    if body.active is not None:
+        s.active = body.active
+    db.commit()
+    return _staff_view(s)
+
+
+# ----- the dashboard page itself -----
+STAFF_PORTAL_DIR = _BASE_DIR / "staff_portal"
+
+
+@app.middleware("http")
+async def staff_page_headers(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/staff"):
+        # The dashboard only loads its own scripts and styles, can't be put in a frame, and isn't cached.
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+if STAFF_PORTAL_DIR.is_dir():
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/staff", StaticFiles(directory=STAFF_PORTAL_DIR, html=True), name="staff_portal")
 
 
 @app.get("/api/v1/accounts")
