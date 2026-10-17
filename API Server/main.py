@@ -6,6 +6,7 @@ Docs / playground:  http://127.0.0.1:8000/docs
 Money is stored as whole minor units (centavos), so there are no floating-point errors.
 Balance > 0 means the customer owes money; balance < 0 means they have credit.
 """
+import asyncio
 import hashlib
 import hmac
 import json
@@ -26,9 +27,10 @@ from dotenv import load_dotenv
 from google.auth.transport import requests as google_auth_transport
 from google.oauth2 import id_token as google_id_token
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
-from sqlalchemy import ForeignKey, String, create_engine, func, select
+from sqlalchemy import ForeignKey, String, create_engine, event, func, inspect as sa_inspect, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 # Anchored to this file's own folder, not the current working directory — otherwise running via
@@ -106,6 +108,11 @@ SMTP_PASSWORD = config_value("SMTP_PASSWORD")
 SMTP_HOST = config_value("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(config_value("SMTP_PORT", "587"))
 
+# Push notifications (Firebase Cloud Messaging). Leave FCM_SERVICE_ACCOUNT_FILE unset and pushes are simply
+# skipped (the app still updates while it's open). To turn them on: Firebase console > Project settings >
+# Service accounts > Generate new private key, save that JSON next to main.py, and set this to its file name.
+FCM_SERVICE_ACCOUNT_FILE = config_value("FCM_SERVICE_ACCOUNT_FILE")
+
 # Leave unset to keep "Sign in with Google" disabled server-side (the app's button will show an error
 # if tapped). Set it to the Web OAuth client ID from Google Cloud Console (APIs & Services >
 # Credentials) — the SAME value the Flutter app uses as its serverClientId. This has to be the Web
@@ -116,6 +123,135 @@ GOOGLE_CLIENT_ID = config_value("GOOGLE_CLIENT_ID")
 
 engine = create_engine(f"sqlite:///{(_BASE_DIR / 'app.db').as_posix()}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
+
+# ---------- live updates ----------
+# Every committed change bumps this counter. The app and the staff dashboard hold a request open on /sync and
+# /staff/sync; it answers the moment the counter moves, so a change shows up on the other side within about a
+# second. (One server process only; with several workers this would need a shared store such as Redis.)
+_change_version = 0
+
+
+@event.listens_for(SessionLocal, "after_commit")
+def _bump_change_version(_session) -> None:
+    global _change_version
+    _change_version += 1
+
+
+# ---------- push notifications ----------
+# Whenever a Notification row is saved (payment received, service suspended, bill issued, a staff reply...) or a
+# link request is approved/declined, the phones of the people affected get a push through Firebase. It's queued
+# during the save and sent from a background thread only after the save succeeded, so a push can never go out for
+# something that was rolled back, and a slow Firebase never slows down a request.
+import threading
+
+_push_credentials = None
+_push_lock = threading.Lock()
+
+
+def _fcm_access_token() -> tuple[str, str] | None:
+    """(access token, Firebase project id), or None when pushes aren't set up."""
+    global _push_credentials
+    if not FCM_SERVICE_ACCOUNT_FILE:
+        return None
+    with _push_lock:
+        if _push_credentials is None:
+            from google.oauth2 import service_account
+            path = Path(FCM_SERVICE_ACCOUNT_FILE)
+            if not path.is_absolute():
+                path = _BASE_DIR / path
+            _push_credentials = service_account.Credentials.from_service_account_file(
+                str(path), scopes=["https://www.googleapis.com/auth/firebase.messaging"])
+        if not _push_credentials.valid:
+            _push_credentials.refresh(google_auth_transport.Request())
+        return _push_credentials.token, _push_credentials.project_id
+
+
+def _fcm_send_one(access: tuple[str, str], token: str, title: str, body: str) -> str:
+    """Returns "ok", "dead" (this token will never work again: delete it) or "error"."""
+    access_token, project = access
+    message = {"message": {
+        "token": token,
+        "notification": {"title": title, "body": body},
+        "android": {"priority": "HIGH", "notification": {"channel_id": "netpulse_alerts"}},
+        "data": {"kind": "refresh"},
+    }}
+    r = httpx.post(f"https://fcm.googleapis.com/v1/projects/{project}/messages:send",
+                   headers={"Authorization": f"Bearer {access_token}"}, json=message, timeout=10)
+    if r.status_code == 200:
+        return "ok"
+    if r.status_code in (400, 404) and ("UNREGISTERED" in r.text or "INVALID_ARGUMENT" in r.text):
+        return "dead"
+    print(f"[push] Firebase said {r.status_code}: {r.text[:200]}")
+    return "error"
+
+
+def _deliver_pushes(items: list[tuple]) -> None:
+    """items: ("account", account_id, title, body) or ("user", user_id, title, body). Runs in a background thread."""
+    try:
+        access = _fcm_access_token()
+        if not access:
+            return
+        with SessionLocal() as db:
+            for kind, target_id, title, body in items:
+                if kind == "account":
+                    user_ids = [r[0] for r in db.execute(select(Link.user_id).where(Link.account_id == target_id))]
+                else:
+                    user_ids = [target_id]
+                if not user_ids:
+                    continue
+                tokens = [r[0] for r in db.execute(select(DeviceToken.token).where(DeviceToken.user_id.in_(user_ids)))]
+                dead = []
+                for t in tokens:
+                    try:
+                        if _fcm_send_one(access, t, title, body) == "dead":
+                            dead.append(t)
+                    except Exception as e:  # one bad send must not stop the others
+                        print(f"[push] send failed: {e}")
+                for t in dead:
+                    row = db.get(DeviceToken, t)
+                    if row:
+                        db.delete(row)
+            db.commit()
+    except Exception as e:
+        print(f"[push] could not send: {e}")
+
+
+def _short(text: str, n: int = 160) -> str:
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+@event.listens_for(SessionLocal, "before_flush")
+def _queue_pushes(session, flush_context, instances) -> None:
+    queue = session.info.setdefault("pushes", [])
+    for obj in session.new:
+        if isinstance(obj, Notification):
+            queue.append(("account", obj.account_id, obj.title, _short(obj.body)))
+    for obj in session.dirty:
+        if isinstance(obj, LinkRequest) and sa_inspect(obj).attrs.status.history.has_changes():
+            if obj.status == "APPROVED":
+                queue.append(("user", obj.user_id, "Account linked", "Your link request was approved. Your account is ready."))
+            elif obj.status == "REJECTED":
+                queue.append(("user", obj.user_id, "Link request declined",
+                              _short(obj.reason) if obj.reason else "Your link request was declined."))
+
+
+@event.listens_for(SessionLocal, "after_commit")
+def _send_queued_pushes(session) -> None:
+    items = session.info.pop("pushes", None)
+    if items and FCM_SERVICE_ACCOUNT_FILE:
+        threading.Thread(target=_deliver_pushes, args=(items,), daemon=True).start()
+
+
+@event.listens_for(SessionLocal, "after_rollback")
+def _drop_queued_pushes(session) -> None:
+    session.info.pop("pushes", None)
+
+
+async def _wait_for_change(since: int, timeout: float = 20.0) -> dict:
+    end = time.monotonic() + timeout
+    while _change_version == since and time.monotonic() < end:
+        await asyncio.sleep(0.4)
+    return {"v": _change_version}
 
 
 # ---------- database models ----------
@@ -224,6 +360,13 @@ class Payment(Base):
     method: Mapped[str | None] = mapped_column(default=None)  # None = paid online; otherwise CASH | GCASH | BANK | OTHER (staff-recorded)
     note: Mapped[str | None] = mapped_column(default=None)
     recorded_by: Mapped[int | None] = mapped_column(ForeignKey("staff.id"), default=None)
+
+
+class DeviceToken(Base):  # a phone that can receive push notifications (one row per Firebase token)
+    __tablename__ = "device_tokens"
+    token: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(default=lambda: datetime.now(timezone.utc))
 
 
 class Notification(Base):
@@ -897,6 +1040,55 @@ def current_staff(creds: HTTPAuthorizationCredentials = Depends(bearer), db: Ses
     if not staff or not staff.active or payload.get("pv") != _staff_pw_version(staff):
         raise HTTPException(401, "Invalid or expired token")
     return staff
+
+
+class DeviceBody(BaseModel):
+    token: str
+
+
+@app.post("/api/v1/devices", status_code=204)
+def register_device(body: DeviceBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """The app registers its Firebase token after sign-in. A phone that changes hands moves to the new login."""
+    token = body.token.strip()
+    if not token or len(token) > 4096:
+        raise HTTPException(422, "Invalid device token")
+    row = db.get(DeviceToken, token)
+    if row:
+        row.user_id = user.id
+    else:
+        db.add(DeviceToken(token=token, user_id=user.id))
+    db.commit()
+
+
+@app.delete("/api/v1/devices", status_code=204)
+def unregister_device(body: DeviceBody, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    row = db.get(DeviceToken, body.token.strip())
+    if row and row.user_id == user.id:
+        db.delete(row)
+        db.commit()
+
+
+@app.get("/api/v1/staff/sync")
+async def staff_sync(since: int = -1, creds: HTTPAuthorizationCredentials = Depends(bearer)):
+    # Check the sign-in in a short-lived session so no database connection is held while we wait.
+    def check():
+        with SessionLocal() as db:
+            current_staff(creds, db)
+    await run_in_threadpool(check)
+    if since < 0:
+        return {"v": _change_version}
+    return await _wait_for_change(since)
+
+
+@app.get("/api/v1/sync")
+async def customer_sync(since: int = -1, creds: HTTPAuthorizationCredentials = Depends(bearer)):
+    def check():
+        with SessionLocal() as db:
+            current_user(creds, db)
+    await run_in_threadpool(check)
+    if since < 0:
+        return {"v": _change_version}
+    return await _wait_for_change(since)
 
 
 def admin_only(staff: Staff = Depends(current_staff)) -> Staff:
@@ -1933,6 +2125,8 @@ def delete_me(body: DeleteMeBody, background: BackgroundTasks,
         db.delete(link)
     for req in db.scalars(select(LinkRequest).where(LinkRequest.user_id == user_id)).all():
         db.delete(req)  # the privacy policy promises these go with the login
+    for dev in db.scalars(select(DeviceToken).where(DeviceToken.user_id == user_id)).all():
+        db.delete(dev)  # this phone stops receiving this login's notifications
     db.delete(user)
     db.commit()
     # Forget any codes still waiting for this user.

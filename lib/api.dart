@@ -74,8 +74,26 @@ class Api {
     }
   }
 
+  /// This phone's Firebase push token (set by push.dart), so sign-out can stop pushes for this login.
+  String? pushToken;
+
+  /// Tells the server this phone should receive push notifications for the signed-in login.
+  Future<void> registerDevice(String deviceToken) async {
+    await _send('POST', '/devices', body: {'token': deviceToken});
+  }
+
   /// Clears both the in-memory token and the saved copy. Safe to call without awaiting.
   Future<void> clearToken() async {
+    final oldToken = token, oldPush = pushToken;
+    if (oldToken != null && oldPush != null) {
+      // Best effort and fire-and-forget: stop pushes for this login on this phone.
+      http
+          .delete(Uri.parse('$baseUrl/devices'),
+              headers: {'Authorization': 'Bearer $oldToken', 'Content-Type': 'application/json'},
+              body: jsonEncode({'token': oldPush}))
+          .timeout(const Duration(seconds: 8))
+          .then((_) {}, onError: (_) {});
+    }
     token = null;
     sessionOnly = false;
     await _storage.delete(key: _tokenKey);
@@ -243,6 +261,19 @@ class Api {
 
   Future<List<dynamic>> payments(int id) async =>
       (await _send('GET', '/accounts/$id/payments')) as List<dynamic>;
+
+  /// Live updates: asks the server to answer as soon as anything changes (or after ~20 seconds with nothing
+  /// new). Pass -1 the first time; pass the number you got back afterwards. Returns the new number.
+  /// Never signs the user out and never shows an error: any failure just throws, and the caller retries.
+  Future<int> waitForChange(int since) async {
+    final t = token;
+    if (t == null) throw ApiException('Not signed in');
+    final res = await http
+        .get(Uri.parse('$baseUrl/sync?since=$since'), headers: {'Authorization': 'Bearer $t'})
+        .timeout(const Duration(seconds: 30));
+    if (res.statusCode != 200) throw ApiException('sync ${res.statusCode}');
+    return (jsonDecode(utf8.decode(res.bodyBytes)) as Map)['v'] as int;
+  }
 
   Future<List<dynamic>> notifications(int id) async =>
       (await _send('GET', '/accounts/$id/notifications')) as List<dynamic>;

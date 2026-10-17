@@ -1,11 +1,17 @@
 # Generated secrets — each machine gets its own; never commit these
 .jwt_secret
 .webhook_secret
+config.json
+firebase-key.json
+*firebase-adminsdk*.json
 
 # Local database — contains whatever test accounts/users you've created
+app.db-journal
 app.db
+*.db
 
 # Python environment and caches
+venv/
 .venv/
 __pycache__/
 *.pyc

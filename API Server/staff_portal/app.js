@@ -68,6 +68,7 @@ function ago(iso) {
 
 async function api(path, { method = 'GET', body } = {}) {
   const headers = { 'Content-Type': 'application/json' };
+  const usedToken = state.token;
   if (state.token) headers.Authorization = `Bearer ${state.token}`;
   let res;
   try {
@@ -77,6 +78,7 @@ async function api(path, { method = 'GET', body } = {}) {
   }
   let data = null;
   try { data = await res.json(); } catch { /* no body */ }
+  if (res.status === 401 && usedToken && usedToken !== state.token) throw new Error('signed out'); // token was replaced meanwhile (password change)
   if (res.status === 401 && state.token) {
     signOut('Your session ended. Please sign in again.');
     throw new Error('signed out');
@@ -168,6 +170,7 @@ function renderLogin() {
         render();
         loadOverview(true);
         loadSummary();
+        liveLoop();
       } catch (err) {
         error.show(err.message);
         submit.disabled = false;
@@ -516,7 +519,7 @@ async function start() {
     try { state.staff = await api('/me'); } catch { state.token = null; }
   }
   render();
-  if (state.token) { loadOverview(true); loadRequests(true); loadSummary(); }
+  if (state.token) { loadOverview(true); loadRequests(true); loadSummary(); liveLoop(); }
 }
 
 // New requests and reports show up on their own while their queue is on screen.
@@ -527,5 +530,47 @@ setInterval(() => {
   if (state.view === 'requests') loadRequests(true);
   if (state.view === 'issues' && !state.issueOpen) loadIssues(true);
 }, 30000);
+
+// Customer page: quietly pick up changes (payments, status...) without wiping a form or password pop-up.
+async function refreshAccountQuietly() {
+  if (state.view !== 'customers' || !state.accountId || !state.account) return;
+  if (state.action || document.querySelector('.modal-backdrop')) return;
+  const id = state.accountId;
+  try {
+    const a = await api(`/accounts/${id}`);
+    if (state.accountId !== id || state.action || document.querySelector('.modal-backdrop')) return;
+    if (JSON.stringify(a) !== JSON.stringify(state.account)) { state.account = a; render(); }
+  } catch (e) { /* the next change tries again */ }
+}
+
+// Live updates: the server answers /staff/sync the moment anything in the database changes (or after ~20s with
+// "nothing new"), and we reload whatever page is open. If the connection drops we wait a few seconds and retry.
+function refreshCurrentView() {
+  loadSummary();
+  if (state.view === 'overview') loadOverview(true);
+  if (state.view === 'requests') loadRequests(true);
+  if (state.view === 'issues' && !state.issueOpen) loadIssues(true);
+  if (state.view === 'customers') { if (state.accountId) refreshAccountQuietly(); else runSearch(); }
+  if (state.view === 'activity' && window.scrollY < 300) loadActivity(true);
+}
+
+let liveRunning = false;
+async function liveLoop() {
+  if (liveRunning) return;
+  liveRunning = true;
+  let since = -1;
+  while (state.token) {
+    try {
+      const d = await api(`/sync?since=${since}`);
+      if (since >= 0 && d.v !== since && !document.hidden) refreshCurrentView();
+      since = d.v;
+    } catch (e) {
+      since = -1;
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+  liveRunning = false;
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden && state.token) refreshCurrentView(); });
 
 start();

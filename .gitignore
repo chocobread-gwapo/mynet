@@ -46,3 +46,6 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# google-services.json is not a password, but it holds your Firebase project's keys, so it's best kept out of a public repo.
+android/app/google-services.json
