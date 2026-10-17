@@ -23,6 +23,40 @@ Widget statusChip(String status) {
   );
 }
 
+/// A clear notice for a suspended account (nothing when the account is active). [reason] is what staff typed.
+/// Paying, bills and issue reports keep working while suspended; plan and add-on changes are switched off.
+Widget suspendedBanner(BuildContext context, Map<String, dynamic> acct) {
+  if (acct['status'] != 'SUSPENDED') return const SizedBox.shrink();
+  final scheme = Theme.of(context).colorScheme;
+  final reason = (acct['status_reason'] as String?)?.trim();
+  return Container(
+    width: double.infinity,
+    margin: const EdgeInsets.only(bottom: 12),
+    padding: const EdgeInsets.all(14),
+    decoration: BoxDecoration(
+      color: scheme.error.withAlpha(30),
+      borderRadius: BorderRadius.circular(14),
+      border: Border.all(color: scheme.error.withAlpha(120)),
+    ),
+    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Icon(Icons.pause_circle_outline, color: scheme.error),
+      const SizedBox(width: 12),
+      Expanded(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Your service is suspended', style: TextStyle(fontWeight: FontWeight.w800, color: scheme.error)),
+          const SizedBox(height: 4),
+          if (reason != null && reason.isNotEmpty) Text('Reason: $reason'),
+          Text(acct['auto_restore'] == true
+              ? 'Your service will be restored automatically once your balance is paid in full. '
+                  'You can still pay, view your bills and report an issue.'
+              : 'Please settle your balance or contact support to have it restored. '
+                  'You can still pay, view your bills and report an issue.'),
+        ]),
+      ),
+    ]),
+  );
+}
+
 /// Two small dots marking "step 2 of 2" on a form that only grows a second step once the server
 /// actually asks for a code (dev mode, with no SMS/email provider configured, never shows it at all).
 Widget stepTwoDots(BuildContext context) {

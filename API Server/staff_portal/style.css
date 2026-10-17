@@ -279,3 +279,9 @@ table.compact td strong { white-space: nowrap; }
 
 .filters { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
 @media (max-width: 640px) { .nowrap { white-space: normal; } }
+
+/* sortable table headers */
+.sort-btn { all: unset; cursor: pointer; font: inherit; letter-spacing: inherit; text-transform: inherit; color: inherit; border-radius: 6px; padding: 2px 4px; margin: -2px -4px; }
+.sort-btn:hover { color: var(--text); }
+.sort-btn:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.sort-btn.on { color: var(--text); }

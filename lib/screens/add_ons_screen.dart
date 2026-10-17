@@ -58,6 +58,7 @@ class _AddOnsScreenState extends State<AddOnsScreen> {
           key: ValueKey(_version),
           load: _load,
           builder: (c, data) => ListView(padding: const EdgeInsets.all(16), children: [
+            suspendedBanner(context, widget.acct),
             const Text('Add-ons appear on your current bill right away, and stay on until you remove them.'),
             const SizedBox(height: 12),
             for (final addon in data.all)
@@ -71,7 +72,9 @@ class _AddOnsScreenState extends State<AddOnsScreen> {
                     ]),
                   ),
                   OutlinedButton(
-                    onPressed: () => _toggle(addon as Map, data.activeIds.contains(addon['id'])),
+                    onPressed: widget.acct['status'] == 'SUSPENDED'
+                        ? null
+                        : () => _toggle(addon as Map, data.activeIds.contains(addon['id'])),
                     child: Text(data.activeIds.contains(addon['id']) ? 'Remove' : 'Add'),
                   ),
                 ]),

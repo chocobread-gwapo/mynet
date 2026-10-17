@@ -82,11 +82,12 @@ class SpeedTester {
         emit(p.copyWith(phase: SpeedPhase.upload, downloadMbps: down, liveMbps: 0));
         final up = await _upload((mbps) => emit(p.copyWith(liveMbps: mbps)));
         emit(p.copyWith(phase: SpeedPhase.done, uploadMbps: up, liveMbps: 0));
-      } catch (_) {
+      } catch (e) {
         if (!_cancelled) {
+          // The technical reason is shown in small print so a failure can be diagnosed (and reported) accurately.
           emit(p.copyWith(
             phase: SpeedPhase.failed,
-            error: "Couldn't reach the speed test server. Check your connection and try again.",
+            error: "Couldn't complete the speed test. Check your connection and try again.\n(${p.phase.name}: $e)",
           ));
         }
       } finally {
@@ -144,13 +145,24 @@ class SpeedTester {
       lastAt = now;
     });
 
+    // Downloads are requested in 10 MB pieces (the loop just asks for the next one), which servers accept far more
+    // reliably than one huge file. One stream failing doesn't end the test as long as some data arrived.
+    Object? lastError;
     Future<void> worker(http.Client client) async {
       while (!_cancelled && sw.elapsed < total) {
-        final res = await client.send(http.Request('GET', Uri.parse('$speedTestBase/__down?bytes=100000000')));
-        if (res.statusCode >= 400) throw StateError('status ${res.statusCode}');
-        await for (final chunk in res.stream) {
-          bytes += chunk.length;
-          if (_cancelled || sw.elapsed >= total) break; // leaving the loop drops the rest of this download
+        try {
+          final res = await client
+              .send(http.Request('GET', Uri.parse('$speedTestBase/__down?bytes=10000000')))
+              .timeout(const Duration(seconds: 8));
+          if (res.statusCode >= 400) throw StateError('server answered ${res.statusCode}');
+          await for (final chunk in res.stream) {
+            bytes += chunk.length;
+            if (_cancelled || sw.elapsed >= total) break; // leaving the loop drops the rest of this download
+          }
+        } catch (e) {
+          lastError = e;
+          if (_cancelled || sw.elapsed >= total) return;
+          await Future<void>.delayed(const Duration(milliseconds: 300));
         }
       }
     }
@@ -167,6 +179,7 @@ class SpeedTester {
       }
     }
     if (_cancelled) throw StateError('cancelled');
+    if (bytes == 0) throw lastError ?? StateError('no data received');
     final start = warmAt ?? Duration.zero;
     final counted = warmAt == null ? bytes : bytes - warmBytes;
     final secs = (sw.elapsed - start).inMicroseconds / 1e6;
@@ -187,15 +200,24 @@ class SpeedTester {
       if (secs > 0.5) onLive(done * 8 / secs / 1e6);
     });
 
+    Object? lastError;
     Future<void> worker(http.Client client) async {
       while (!_cancelled && sw.elapsed < total) {
-        final res = await client.post(
-          Uri.parse('$speedTestBase/__up'),
-          headers: {'Content-Type': 'application/octet-stream'},
-          body: payload,
-        );
-        if (res.statusCode >= 400) throw StateError('status ${res.statusCode}');
-        done += chunkSize;
+        try {
+          final res = await client
+              .post(
+                Uri.parse('$speedTestBase/__up'),
+                headers: {'Content-Type': 'application/octet-stream'},
+                body: payload,
+              )
+              .timeout(const Duration(seconds: 8));
+          if (res.statusCode >= 400) throw StateError('server answered ${res.statusCode}');
+          done += chunkSize;
+        } catch (e) {
+          lastError = e;
+          if (_cancelled || sw.elapsed >= total) return;
+          await Future<void>.delayed(const Duration(milliseconds: 300));
+        }
       }
     }
 
@@ -211,6 +233,7 @@ class SpeedTester {
       }
     }
     if (_cancelled) throw StateError('cancelled');
+    if (done == 0) throw lastError ?? StateError('nothing was uploaded');
     final secs = sw.elapsedMicroseconds / 1e6;
     return secs > 0 ? done * 8 / secs / 1e6 : 0.0;
   }

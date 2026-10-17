@@ -292,6 +292,9 @@ class Account(Base):
     mobile: Mapped[str]
     service_address: Mapped[str]
     status: Mapped[str] = mapped_column(default="ACTIVE")  # ACTIVE | SUSPENDED
+    status_reason: Mapped[str | None] = mapped_column(default=None)  # why it was suspended (shown to the customer)
+    # Set by staff when suspending for unpaid bills: the service comes back by itself once the balance is paid off.
+    auto_restore: Mapped[bool] = mapped_column(default=False)
     plan_id: Mapped[int] = mapped_column(ForeignKey("plans.id"))
     balance: Mapped[int] = mapped_column(default=0)
     due_date: Mapped[date]
@@ -434,7 +437,8 @@ def seed() -> None:
             if col not in have:
                 conn.exec_driver_sql(f"ALTER TABLE link_requests ADD COLUMN {col} {kind}")
         for table, cols in (("payments", (("method", "VARCHAR"), ("note", "VARCHAR"), ("recorded_by", "INTEGER"))),
-                            ("issues", (("resolved_by", "INTEGER"), ("resolved_at", "DATETIME"), ("reply", "VARCHAR")))):
+                            ("issues", (("resolved_by", "INTEGER"), ("resolved_at", "DATETIME"), ("reply", "VARCHAR"))),
+                            ("accounts", (("status_reason", "VARCHAR"), ("auto_restore", "BOOLEAN DEFAULT 0")))):
             have = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
             for col, kind in cols:
                 if col not in have:
@@ -549,6 +553,8 @@ def account_view(a: Account, db: Session) -> dict:
     plan = db.get(Plan, a.plan_id)
     return {
         "id": a.id, "account_no": a.account_no, "holder_name": a.holder_name, "status": a.status,
+        "status_reason": a.status_reason if a.status == "SUSPENDED" else None,
+        "auto_restore": bool(a.auto_restore) if a.status == "SUSPENDED" else False,
         "service_address": a.service_address, "mobile": a.mobile, "due_date": a.due_date.isoformat(),
         "plan": {"id": plan.id, "name": plan.name, "speed_mbps": plan.speed_mbps, "monthly_fee": plan.monthly_fee},
         **money(a.balance),
@@ -1440,6 +1446,16 @@ def _need_account(db: Session, account_id: int) -> Account:
     return acct
 
 
+def _auto_restore_if_paid(db: Session, acct: Account, staff: Staff | None = None) -> None:
+    """After a payment: if staff suspended this account for unpaid bills ("restore automatically") and the balance
+    is now settled, switch the service back on and tell the customer. Does nothing for any other suspension."""
+    if acct.status == "SUSPENDED" and acct.auto_restore and acct.balance <= 0:
+        acct.status, acct.status_reason, acct.auto_restore = "ACTIVE", None, False
+        _notify_account(db, acct, "Service restored", "Thank you for your payment. Your service is active again.")
+        if staff is not None:
+            _audit(db, staff, acct.id, "REACTIVATE", "Automatic: balance paid in full")
+
+
 def _notify_account(db: Session, acct: Account, title: str, body: str) -> None:
     db.add(Notification(account_id=acct.id, title=title, body=body))
 
@@ -1511,18 +1527,42 @@ def staff_summary(_: Staff = Depends(current_staff), db: Session = Depends(get_d
 
 def _account_row(a: Account, plan: Plan | None, logins: int) -> dict:
     return {"id": a.id, "account_no": a.account_no, "holder_name": a.holder_name, "mobile": a.mobile,
-            "service_address": a.service_address, "status": a.status, "plan": plan.name if plan else None,
-            "balance": a.balance, "due_date": a.due_date.isoformat(), "linked_logins": logins}
+            "service_address": a.service_address, "status": a.status, "status_reason": a.status_reason,
+            "auto_restore": bool(a.auto_restore) if a.status == "SUSPENDED" else False, "plan": plan.name if plan else None, "balance": a.balance, "due_date": a.due_date.isoformat(), "linked_logins": logins}
 
 
 @app.get("/api/v1/staff/accounts")
-def staff_search_accounts(q: str = "", _: Staff = Depends(current_staff), db: Session = Depends(get_db)):
-    stmt = select(Account)
+def staff_search_accounts(q: str = "", status: str = "", balance: str = "", plan_id: int | None = None,
+                          sort: str = "account", dir: str = "asc", offset: int = 0,
+                          _: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    """Search + filter + sort, 50 per page (pass offset=50, 100... for the next pages). Filtering and sorting happen
+    here in the database, so "biggest balance first" really means across all accounts, not just the page on screen."""
+    stmt = select(Account).join(Plan, Plan.id == Account.plan_id)
     if q.strip():
         like = _like(q)
         stmt = stmt.where(Account.account_no.ilike(like) | Account.holder_name.ilike(like)
                           | Account.mobile.ilike(like) | Account.service_address.ilike(like))
-    rows = db.scalars(stmt.order_by(Account.account_no).limit(50)).all()
+    if status:
+        if status.upper() not in ("ACTIVE", "SUSPENDED"):
+            raise HTTPException(422, "status must be ACTIVE or SUSPENDED")
+        stmt = stmt.where(Account.status == status.upper())
+    if balance:
+        if balance == "owes":
+            stmt = stmt.where(Account.balance > 0)
+        elif balance == "credit":
+            stmt = stmt.where(Account.balance < 0)
+        elif balance == "settled":
+            stmt = stmt.where(Account.balance == 0)
+        else:
+            raise HTTPException(422, "balance must be owes, credit or settled")
+    if plan_id:
+        stmt = stmt.where(Account.plan_id == plan_id)
+    columns = {"account": Account.account_no, "holder": func.lower(Account.holder_name), "balance": Account.balance,
+               "due": Account.due_date, "status": Account.status, "plan": Plan.name}
+    if sort not in columns or dir not in ("asc", "desc"):
+        raise HTTPException(422, "Unknown sort")
+    key = columns[sort].desc() if dir == "desc" else columns[sort].asc()
+    rows = db.scalars(stmt.order_by(key, Account.account_no).offset(max(offset, 0)).limit(50)).all()
     out = []
     for a in rows:
         n = len(db.scalars(select(Link).where(Link.account_id == a.id)).all())
@@ -1637,6 +1677,7 @@ def staff_record_payment(account_id: int, body: RecordPaymentBody, staff: Staff 
     db.add(pay)
     a.balance -= body.amount
     _notify_account(db, a, "Payment received", f"We received {_pesos(body.amount)}. Thank you!")
+    _auto_restore_if_paid(db, a, staff)
     _audit(db, staff, a.id, "RECORD_PAYMENT", f"{_pesos(body.amount)} by {method}" + (f" ({note})" if note else ""))
     db.commit()
     return staff_account_detail(account_id, staff, db)
@@ -1721,6 +1762,7 @@ def staff_change_plan(account_id: int, body: ChangePlanBody, staff: Staff = Depe
 class SetStatusBody(MoneyAction):
     status: str
     reason: str | None = None
+    auto_restore: bool = False  # only used when suspending
 
 
 @app.post("/api/v1/staff/accounts/{account_id}/status")
@@ -1735,10 +1777,15 @@ def staff_set_status(account_id: int, body: SetStatusBody, staff: Staff = Depend
         raise HTTPException(409, f"The account is already {status.lower()}")
     reason = (body.reason or "").strip()[:200]
     a.status = status
+    a.status_reason = reason or None if status == "SUSPENDED" else None
+    a.auto_restore = bool(body.auto_restore) if status == "SUSPENDED" else False
     _notify_account(db, a, "Service suspended" if status == "SUSPENDED" else "Service restored",
                     ("Your service was suspended." if status == "SUSPENDED" else "Your service is active again.")
-                    + (f" Reason: {reason}" if reason else ""))
-    _audit(db, staff, a.id, "SUSPEND" if status == "SUSPENDED" else "REACTIVATE", reason or "")
+                    + (f" Reason: {reason}" if reason else "")
+                    + (" It will be restored automatically once your balance is paid in full."
+                       if status == "SUSPENDED" and a.auto_restore else ""))
+    _audit(db, staff, a.id, "SUSPEND" if status == "SUSPENDED" else "REACTIVATE",
+           (reason or "") + (" (auto-restores when paid in full)" if status == "SUSPENDED" and a.auto_restore else ""))
     db.commit()
     return staff_account_detail(account_id, staff, db)
 
@@ -1843,9 +1890,23 @@ ACTIVITY_PAGE = 50
 @app.get("/api/v1/staff/activity")
 def staff_activity(staff_id: int | None = None, action: str | None = None, q: str | None = None,
                    since: date | None = None, until: date | None = None, before_id: int | None = None,
-                   _: Staff = Depends(admin_only), db: Session = Depends(get_db)):
+                   order: str = "desc", export: bool = False,
+                   staff: Staff = Depends(admin_only), db: Session = Depends(get_db)):
     """Everything staff have done, newest first, 50 at a time (pass the last id as before_id for the next page).
-    Dates are Philippine calendar days, and `until` includes that whole day."""
+    Dates are Philippine calendar days, and `until` includes that whole day.
+    With order=asc it is oldest first, and the cursor (still called before_id) means "continue after this id"."""
+    if order not in ("asc", "desc"):
+        raise HTTPException(422, "order must be asc or desc")
+    if export and not before_id:
+        # The dashboard's "Export CSV" button asks for this once per export (its first page). It is recorded here,
+        # on the server, before the data is returned, so an export can't happen without leaving a trace.
+        who = db.get(Staff, staff_id) if staff_id else None
+        parts = [f"staff {who.name}" if who else None, f"action {action}" if action else None,
+                 f'search "{q.strip()[:40]}"' if q and q.strip() else None,
+                 f"from {since.isoformat()}" if since else None, f"to {until.isoformat()}" if until else None]
+        filters = ", ".join(p for p in parts if p)
+        _audit(db, staff, None, "EXPORT_ACTIVITY", "Exported the activity log" + (f" ({filters})" if filters else " (no filters)"))
+        db.commit()
     ph = timezone(timedelta(hours=8))
 
     def utc_start(d: date) -> datetime:
@@ -1866,8 +1927,9 @@ def staff_activity(staff_id: int | None = None, action: str | None = None, q: st
     if until:
         stmt = stmt.where(StaffAction.created_at < utc_start(until + timedelta(days=1)))
     if before_id:
-        stmt = stmt.where(StaffAction.id < before_id)
-    rows = db.execute(stmt.order_by(StaffAction.id.desc()).limit(ACTIVITY_PAGE + 1)).all()
+        stmt = stmt.where(StaffAction.id > before_id if order == "asc" else StaffAction.id < before_id)
+    rows = db.execute(stmt.order_by(StaffAction.id.asc() if order == "asc" else StaffAction.id.desc())
+                      .limit(ACTIVITY_PAGE + 1)).all()
     more = len(rows) > ACTIVITY_PAGE
     rows = rows[:ACTIVITY_PAGE]
     return {
@@ -2261,6 +2323,7 @@ def _mark_paid(db: Session, payment: Payment) -> None:
     acct.balance -= payment.amount
     db.add(Notification(account_id=acct.id, title="Payment received",
                         body=f"We received {CURRENCY}{payment.amount / 100:,.2f}. Thank you!"))
+    _auto_restore_if_paid(db, acct)
     db.commit()
 
 
@@ -2410,6 +2473,14 @@ def list_plans(db: Session = Depends(get_db)):
     return [{"id": p.id, "name": p.name, "speed_mbps": p.speed_mbps, "monthly_fee": p.monthly_fee} for p in rows]
 
 
+def _require_service_active(a: Account) -> None:
+    """A suspended account can still look around, pay, and contact support, but can't change its service
+    (plan or add-ons). The message tells the customer what to do about it."""
+    if a.status == "SUSPENDED":
+        raise HTTPException(403, "Your service is suspended, so plan and add-on changes aren't available. "
+                                 "Please settle your balance or contact support to have it restored.")
+
+
 class UpgradeBody(BaseModel):
     plan_id: int
     current_password: str
@@ -2418,6 +2489,7 @@ class UpgradeBody(BaseModel):
 @app.post("/api/v1/accounts/{account_id}/upgrade")
 def upgrade_plan(body: UpgradeBody, a: Account = Depends(my_account), user: User = Depends(current_user),
                  db: Session = Depends(get_db)):
+    _require_service_active(a)
     rate_limit(f"me-plan:{user.id}")
     _require_password(user, body.current_password)  # a plan switch changes the bill, so it asks like other changes
     if a.balance > 0:  # business rule lives on the server, not just in the app
@@ -2495,6 +2567,7 @@ class RemoveAddOnBody(BaseModel):
 @app.post("/api/v1/accounts/{account_id}/addons", status_code=201)
 def subscribe_addon(body: AddOnBody, a: Account = Depends(my_account), user: User = Depends(current_user),
                     db: Session = Depends(get_db)):
+    _require_service_active(a)
     rate_limit(f"me-addon:{user.id}")
     _require_password(user, body.current_password)
     addon = db.get(AddOn, body.addon_id)
@@ -2512,6 +2585,7 @@ def subscribe_addon(body: AddOnBody, a: Account = Depends(my_account), user: Use
 def unsubscribe_addon(addon_id: int, body: RemoveAddOnBody, a: Account = Depends(my_account),
                       user: User = Depends(current_user), db: Session = Depends(get_db)):
     """Was a body-less DELETE; now a POST so it can carry the password (no password-free route is left)."""
+    _require_service_active(a)
     rate_limit(f"me-addon:{user.id}")
     _require_password(user, body.current_password)
     link = db.get(AccountAddOn, (a.id, addon_id))

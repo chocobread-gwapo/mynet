@@ -21,6 +21,7 @@ class HomePage extends StatelessWidget {
     return RefreshIndicator(
       onRefresh: onChanged,
       child: ListView(padding: const EdgeInsets.all(16), children: [
+        suspendedBanner(context, acct),
         Panel(
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(children: [

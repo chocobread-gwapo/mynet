@@ -27,7 +27,7 @@ const field = (label, el, hint) => h('div', {}, hint ? h('div', { class: 'label-
 const isAdmin = () => state.staff && state.staff.role === 'admin';
 
 const ACTION_LABELS = {
-  RECORD_PAYMENT: 'Recorded a payment', ADJUST_CREDIT: 'Applied a credit', ADJUST_CHARGE: 'Applied a charge',
+  EXPORT_ACTIVITY: 'Exported the activity log', RECORD_PAYMENT: 'Recorded a payment', ADJUST_CREDIT: 'Applied a credit', ADJUST_CHARGE: 'Applied a charge',
   ISSUE_BILL: 'Issued a bill', CHANGE_PLAN: 'Changed the plan', SUSPEND: 'Suspended service',
   REACTIVATE: 'Restored service', EDIT_CONTACT: 'Edited account details', UNLINK_LOGIN: 'Unlinked a login',
   RESOLVE_ISSUE: 'Resolved a report', REOPEN_ISSUE: 'Reopened a report',
@@ -39,12 +39,20 @@ const ACTION_LABELS = {
 // ---------- customers: search ----------
 let searchSeq = 0;
 
-async function runSearch() {
+async function runSearch(more) {
   const mine = ++searchSeq;
   try {
-    const rows = await api(`/${state.searchKind}?q=${encodeURIComponent(state.q.trim())}`);
+    const params = new URLSearchParams({ q: state.q.trim() });
+    if (state.searchKind === 'accounts') {
+      for (const [k, v] of Object.entries(state.acctFilter)) if (v) params.set(k, v);
+      params.set('sort', state.acctSort.key);
+      params.set('dir', state.acctSort.dir);
+      if (more) params.set('offset', String(state.results.length));
+    }
+    const rows = await api(`/${state.searchKind}?${params}`);
     if (mine !== searchSeq) return; // a newer search is already on its way
-    state.results = rows;
+    state.results = more ? state.results.concat(rows) : rows;
+    state.moreResults = state.searchKind === 'accounts' && rows.length === 50;
     state.searched = true;
     state.error = null;
   } catch (err) {
@@ -64,12 +72,24 @@ function paintResults() {
   }
   let table;
   if (state.searchKind === 'accounts') {
+    // Column headers with a sort key are clickable: first click sorts ascending, a second click flips it.
+    const sortable = [['Account', 'account'], ['Holder', 'holder'], ['Mobile', null], ['Plan', 'plan'], ['Balance', 'balance'],
+      ['Due', 'due'], ['Status', 'status'], ['Logins', null]];
+    const head = sortable.map(([label, key]) => {
+      if (!key) return h('th', {}, label);
+      const on = state.acctSort.key === key;
+      return h('th', { 'aria-sort': on ? (state.acctSort.dir === 'asc' ? 'ascending' : 'descending') : 'none' },
+        h('button', { class: `sort-btn${on ? ' on' : ''}`, type: 'button', onclick: () => {
+          state.acctSort = on ? { key, dir: state.acctSort.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: key === 'balance' ? 'desc' : 'asc' };
+          runSearch();
+        } }, label, on ? (state.acctSort.dir === 'asc' ? ' \u25B2' : ' \u25BC') : ''));
+    });
     table = h('table', {},
-      h('thead', {}, h('tr', {}, ['Account', 'Holder', 'Mobile', 'Plan', 'Balance', 'Status', 'Logins'].map((t) => h('th', {}, t)))),
+      h('thead', {}, h('tr', {}, head)),
       h('tbody', {}, rows.map((a) => h('tr', { class: 'click', onclick: () => openAccount(a.id) },
         h('td', {}, h('button', { class: 'link-btn', onclick: (e) => { e.stopPropagation(); openAccount(a.id); } }, a.account_no)),
         h('td', {}, a.holder_name), h('td', {}, a.mobile), h('td', {}, a.plan || '-'),
-        h('td', {}, balanceChip(a.balance)), h('td', {}, statusChip(a.status)), h('td', {}, a.linked_logins)))));
+        h('td', {}, balanceChip(a.balance)), h('td', {}, fmtDate(a.due_date)), h('td', {}, statusChip(a.status)), h('td', {}, a.linked_logins)))));
   } else {
     table = h('table', {},
       h('thead', {}, h('tr', {}, ['Email', 'Name', 'Mobile', 'Linked accounts'].map((t) => h('th', {}, t)))),
@@ -81,7 +101,8 @@ function paintResults() {
           : h('span', { class: 'muted' }, 'None yet'))))));
   }
   box.replaceChildren(h('div', { class: 'table-wrap' }, table),
-    rows.length === 50 ? h('p', { class: 'muted hint' }, 'Showing the first 50. Type more to narrow it down.') : null);
+    h('p', { class: 'muted hint' }, `${rows.length} shown`),
+    state.moreResults ? h('button', { class: 'btn', type: 'button', onclick: () => runSearch(true) }, 'Load more') : null);
 }
 
 function viewCustomers() {
@@ -98,9 +119,27 @@ function viewCustomers() {
       onclick: () => { state.searchKind = key; state.results = []; state.searched = false; render(); runSearch(); },
     }, label)));
   queueMicrotask(() => { paintResults(); if (!state.searched) runSearch(); });
+  let filters = null;
+  if (state.searchKind === 'accounts') {
+    const f = state.acctFilter;
+    const pick = (label, key, options) => {
+      const sel = h('select', { 'aria-label': label, onchange: () => { f[key] = sel.value; runSearch(); } },
+        h('option', { value: '' }, label), options.map(([v, t]) => h('option', { value: v, selected: String(f[key]) === String(v) }, t)));
+      return sel;
+    };
+    if (!state.plans.length) api('/plans').then((p) => { state.plans = p; if (state.view === 'customers' && !state.accountId) render(); }).catch(() => {});
+    filters = h('div', { class: 'filters' },
+      pick('Any status', 'status', [['ACTIVE', 'Active'], ['SUSPENDED', 'Suspended']]),
+      pick('Any balance', 'balance', [['owes', 'Owes money'], ['credit', 'Has credit'], ['settled', 'Settled']]),
+      pick('Any plan', 'plan_id', state.plans.map((p) => [p.id, p.name])),
+      h('button', { class: 'btn', type: 'button', onclick: () => {
+        state.acctFilter = { status: '', balance: '', plan_id: '' }; state.acctSort = { key: 'account', dir: 'asc' }; state.q = ''; render(); runSearch();
+      } }, 'Reset'));
+  }
   return h('div', {},
     h('div', { class: 'page-title' }, h('h2', {}, 'Customers'), seg),
     h('div', { class: 'search' }, input),
+    filters,
     h('div', { id: 'results' }));
 }
 
@@ -308,12 +347,14 @@ function actionPanel(a) {
   if (kind === 'status') {
     const suspending = a.status === 'ACTIVE';
     const reason = h('input', { maxlength: '200', placeholder: suspending ? 'e.g. unpaid for 60 days' : 'optional', autocomplete: 'off' });
+    const auto = h('input', { type: 'checkbox', checked: a.balance > 0 });
     return actionForm(suspending ? 'Suspend service' : 'Restore service',
       suspending ? 'The customer is told their service was suspended.' : 'The customer is told their service is active again.',
-      [h('div', { class: 'span2' }, field('Reason (optional)', reason))],
+      [h('div', { class: 'span2' }, field('Reason (optional)', reason)),
+        suspending ? h('div', { class: 'span2' }, h('label', { class: 'check' }, auto, 'Restore automatically once the balance is paid in full')) : null],
       suspending ? 'Suspend service' : 'Restore service',
       (ask) => ask(`${suspending ? 'Suspend' : 'Restore'} service for ${a.account_no} (${a.holder_name}). The customer is notified.`,
-        (password) => accountCall('status', { status: suspending ? 'SUSPENDED' : 'ACTIVE', reason: reason.value, password },
+        (password) => accountCall('status', { status: suspending ? 'SUSPENDED' : 'ACTIVE', reason: reason.value, auto_restore: suspending && auto.checked, password },
           suspending ? 'Service suspended.' : 'Service restored.')), suspending);
   }
   if (kind === 'contact') {
@@ -376,7 +417,8 @@ function viewAccountDetail() {
       h('div', { class: 'chips flush' }, statusChip(a.status), balanceChip(a.balance))),
     h('div', { class: 'cols' },
       h('div', { class: 'box' }, h('h4', {}, 'Account'),
-        row('Holder', a.holder_name), row('Mobile', a.mobile), row('Address', a.service_address), row('Due date', fmtDate(a.due_date))),
+        row('Holder', a.holder_name), row('Mobile', a.mobile), row('Address', a.service_address), row('Due date', fmtDate(a.due_date)),
+        a.status === 'SUSPENDED' ? row('Suspended for', (a.status_reason || 'No reason given') + (a.auto_restore ? ' (restores itself when paid in full)' : '')) : null),
       h('div', { class: 'box' }, h('h4', {}, 'Plan'),
         row('Plan', a.plan), row('Monthly fee', money(a.plan_fee)),
         row('Add-ons', a.addons.length ? a.addons.map((x) => `${x.name} (${money(x.monthly_fee)})`).join(', ') : 'None'),
@@ -409,8 +451,10 @@ async function loadIssues(quiet) {
     state.error = err.message;
     if (!quiet) toast(err.message);
   }
-  if (state.view === 'issues' && !state.issueOpen) render();
-  else updateBadges();
+  if (state.view === 'issues' && !state.issueOpen) {
+    // Don't rebuild the page under someone who is typing in the search box: just refresh the list.
+    if (document.activeElement && document.activeElement.type === 'search') { paintIssueList(); updateBadges(); } else render();
+  } else updateBadges();
 }
 
 function issueCard(i) {
@@ -450,19 +494,46 @@ function issueCard(i) {
   return h('article', { class: 'card' }, body);
 }
 
+// The list under the filter bar is repainted on its own, so typing in the search box never loses focus.
+function paintIssueList() {
+  const box = document.getElementById('issue-list');
+  if (!box) return;
+  const v = state.issueView;
+  const needle = v.q.trim().toLowerCase();
+  let items = state.issues.items.filter((i) => (!v.category || i.category === v.category)
+    && (!needle || `${i.account.account_no} ${i.account.holder_name} ${i.message}`.toLowerCase().includes(needle)));
+  // Default order: open = oldest first (longest waiting), resolved = newest first. The picker overrides it.
+  const oldestFirst = v.order ? v.order === 'asc' : state.issueFilter === 'OPEN';
+  items = items.slice().sort((a, b) => (oldestFirst ? 1 : -1) * (new Date(a.created_at) - new Date(b.created_at)));
+  const filtered = v.category || needle;
+  box.replaceChildren(...(items.length ? items.map(issueCard)
+    : [h('div', { class: 'empty' }, filtered ? 'No reports match these filters.'
+      : (state.issueFilter === 'OPEN' ? 'No open reports. Nice.' : 'Nothing resolved yet.'))]));
+}
+
 function viewIssues() {
-  const c = state.issues.counts;
+  const c = state.issues.counts, v = state.issueView;
   const seg = h('div', { class: 'seg', role: 'tablist' },
     ...[['OPEN', `Open (${c.OPEN})`], ['RESOLVED', `Resolved (${c.RESOLVED})`]].map(([key, label]) => h('button', {
       class: state.issueFilter === key ? 'active' : '', role: 'tab',
       onclick: () => { state.issueFilter = key; state.issueOpen = null; loadIssues(); },
     }, label)));
-  const items = state.issues.items;
+  const categories = [...new Set(state.issues.items.map((i) => i.category))].sort();
+  const catSel = h('select', { 'aria-label': 'Category', onchange: () => { v.category = catSel.value; paintIssueList(); } },
+    h('option', { value: '' }, 'All categories'),
+    categories.map((x) => h('option', { value: x, selected: x === v.category }, x)));
+  const search = h('input', { type: 'search', placeholder: 'Search account, name or message', value: v.q, autocomplete: 'off', 'aria-label': 'Search' });
+  search.addEventListener('input', () => { v.q = search.value; paintIssueList(); });
+  const orderSel = h('select', { 'aria-label': 'Order', onchange: () => { v.order = orderSel.value; paintIssueList(); } },
+    h('option', { value: '' }, state.issueFilter === 'OPEN' ? 'Oldest first' : 'Newest first'),
+    h('option', { value: state.issueFilter === 'OPEN' ? 'desc' : 'asc', selected: v.order !== '' }, state.issueFilter === 'OPEN' ? 'Newest first' : 'Oldest first'));
+  const clear = h('button', { class: 'btn', type: 'button', onclick: () => { state.issueView = { category: '', q: '', order: '' }; render(); } }, 'Clear');
+  queueMicrotask(paintIssueList);
   return h('div', {},
     h('div', { class: 'page-title' }, h('h2', {}, 'Issues'), seg),
     state.error ? h('div', { class: 'error' }, state.error) : null,
-    items.length ? items.map(issueCard)
-      : h('div', { class: 'empty' }, state.issueFilter === 'OPEN' ? 'No open reports. Nice.' : 'Nothing resolved yet.'));
+    h('div', { class: 'filters' }, catSel, orderSel, search, clear),
+    h('div', { id: 'issue-list' }));
 }
 
 
@@ -592,6 +663,57 @@ function paintActivity() {
       a.next ? h('button', { class: 'btn', onclick: (e) => { e.target.disabled = true; loadActivity(false, true); } }, 'Load more') : null));
 }
 
+// ---- CSV export of the activity log: every row matching the current filters, not just what is on screen ----
+const EXPORT_MAX_ROWS = 20000;
+
+// A cell that starts with = + - @ (or a tab/CR) would be run as a formula by Excel/Sheets; a leading apostrophe stops that.
+function csvCell(v) {
+  let t = v == null ? '' : String(v);
+  if (/^[=+\-@\t\r]/.test(t)) t = "'" + t;
+  return /[",\n\r]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t;
+}
+
+function phTime(iso) { // "2026-10-18 05:46:12" in Philippine time (UTC+8)
+  const d = new Date(new Date(iso).getTime() + 8 * 3600 * 1000);
+  return d.toISOString().slice(0, 19).replace('T', ' ');
+}
+
+async function exportActivityCsv(button) {
+  const label = button.textContent;
+  button.disabled = true;
+  try {
+    const rows = [];
+    let before = null, truncated = false;
+    for (;;) {
+      button.textContent = `Exporting... ${rows.length}`;
+      const d = await api(`/activity?${activityQuery(before ? { before_id: before } : { export: '1' })}`); // the server logs the export on this first request
+      rows.push(...d.items);
+      if (!d.next_before_id) break;
+      if (rows.length >= EXPORT_MAX_ROWS) { truncated = true; break; }
+      before = d.next_before_id;
+    }
+    if (!rows.length) { toast('Nothing to export for these filters.'); return; }
+    const lines = [['Date and time (PH)', 'Staff', 'Action', 'Account', 'Details'].map(csvCell).join(',')];
+    for (const r of rows) {
+      lines.push([phTime(r.at), r.by, ACTION_LABELS[r.action] || r.action, r.account_no || '', r.detail || ''].map(csvCell).join(','));
+    }
+    // The BOM makes Excel read the file as UTF-8 (so the peso sign and accents come out right).
+    const blob = new Blob(['\ufeff' + lines.join('\r\n') + '\r\n'], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = h('a', { href: url, download: `netpulse-activity-${phTime(new Date().toISOString()).slice(0, 10)}.csv` });
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    toast(truncated ? `Exported the newest ${rows.length} rows (the limit). Narrow the dates to get older ones.` : `Exported ${rows.length} rows.`);
+  } catch (err) {
+    if (err.message !== 'signed out') toast(err.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
 function viewActivity() {
   const a = state.activity, f = state.activityFilter;
   const reload = () => loadActivity(false);
@@ -606,11 +728,14 @@ function viewActivity() {
   search.addEventListener('input', () => { f.q = search.value; clearTimeout(timer); timer = setTimeout(reload, 300); });
   const since = h('input', { type: 'date', value: f.since, 'aria-label': 'From date', onchange: () => { f.since = since.value; reload(); } });
   const until = h('input', { type: 'date', value: f.until, 'aria-label': 'To date', onchange: () => { f.until = until.value; reload(); } });
-  const clear = h('button', { class: 'btn', onclick: () => { state.activityFilter = { staff_id: '', action: '', q: '', since: '', until: '' }; render(); loadActivity(false); } }, 'Clear');
+  const exportBtn = h('button', { class: 'btn', type: 'button', onclick: () => exportActivityCsv(exportBtn) }, 'Export CSV');
+  const orderSel = h('select', { 'aria-label': 'Order', onchange: () => { f.order = orderSel.value; reload(); } },
+    h('option', { value: '' }, 'Newest first'), h('option', { value: 'asc', selected: f.order === 'asc' }, 'Oldest first'));
+  const clear = h('button', { class: 'btn', onclick: () => { state.activityFilter = { staff_id: '', action: '', q: '', since: '', until: '', order: '' }; render(); loadActivity(false); } }, 'Clear');
   queueMicrotask(paintActivity);
   return h('div', {},
-    h('div', { class: 'page-title' }, h('h2', {}, 'Activity'), h('span', { class: 'muted' }, 'Everything staff have done, newest first.')),
+    h('div', { class: 'page-title' }, h('h2', {}, 'Activity'), h('span', { class: 'muted' }, 'Everything staff have done.')),
     state.error ? h('div', { class: 'error' }, state.error) : null,
-    h('div', { class: 'filters' }, staffSel, actSel, h('label', { class: 'date-field' }, 'From', since), h('label', { class: 'date-field' }, 'To', until), search, clear),
+    h('div', { class: 'filters' }, staffSel, actSel, orderSel, h('label', { class: 'date-field' }, 'From', since), h('label', { class: 'date-field' }, 'To', until), search, clear, exportBtn),
     h('div', { id: 'activity-list' }));
 }

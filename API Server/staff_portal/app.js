@@ -11,12 +11,13 @@ const state = {
   staff: null,
   view: 'overview', // overview | requests | customers | issues | staff | account
   overview: null,
-  activity: { items: [], next: null, staff: [], actions: [], loaded: false }, activityFilter: { staff_id: '', action: '', q: '', since: '', until: '' },
+  activity: { items: [], next: null, staff: [], actions: [], loaded: false }, activityFilter: { staff_id: '', action: '', q: '', since: '', until: '', order: '' },
   summary: { pending_requests: 0, open_issues: 0 },
   remember: false, loginMode: 'signin', resetEmail: '', notice: null,
   q: '', searchKind: 'accounts', results: [], searched: false, // customers
+  acctFilter: { status: '', balance: '', plan_id: '' }, acctSort: { key: 'account', dir: 'asc' }, moreResults: false,
   accountId: null, account: null, action: null, plans: [], // one customer's page, and which action panel is open
-  issueFilter: 'OPEN', issues: { counts: { OPEN: 0, RESOLVED: 0 }, items: [] }, issueOpen: null,
+  issueFilter: 'OPEN', issueView: { category: '', q: '', order: '' }, issues: { counts: { OPEN: 0, RESOLVED: 0 }, items: [] }, issueOpen: null,
   filter: 'PENDING',
   requests: { counts: { PENDING: 0, APPROVED: 0, REJECTED: 0 }, items: [] },
   staffList: [],
@@ -550,7 +551,7 @@ function refreshCurrentView() {
   if (state.view === 'overview') loadOverview(true);
   if (state.view === 'requests') loadRequests(true);
   if (state.view === 'issues' && !state.issueOpen) loadIssues(true);
-  if (state.view === 'customers') { if (state.accountId) refreshAccountQuietly(); else runSearch(); }
+  if (state.view === 'customers') { if (state.accountId) refreshAccountQuietly(); else if (state.results.length <= 50) runSearch(); }
   if (state.view === 'activity' && window.scrollY < 300) loadActivity(true);
 }
 

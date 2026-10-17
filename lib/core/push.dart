@@ -1,3 +1,9 @@
+// Firebase marks getToken()/onTokenRefresh as deprecated in favor of register()/onRegistered, but the newer pair is
+// not a drop-in replacement: onRegistered hands out a Firebase Installation ID (FID, for "direct send"), not the FCM
+// token this app's server sends to. Switching would need the server to address pushes by FID too, so the working
+// methods are kept on purpose.
+// ignore_for_file: deprecated_member_use
+
 import 'dart:async';
 
 import 'package:firebase_core/firebase_core.dart';

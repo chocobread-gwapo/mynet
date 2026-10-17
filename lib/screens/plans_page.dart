@@ -30,7 +30,9 @@ class PlansPage extends StatelessWidget {
   Widget build(BuildContext context) {
     final due = acct['amount_due'] as int;
     final currentId = (acct['plan'] as Map)['id'];
+    final suspended = acct['status'] == 'SUSPENDED';
     return ListView(padding: const EdgeInsets.all(16), children: [
+      suspendedBanner(context, acct),
       Panel(
         child: ListTile(
           contentPadding: EdgeInsets.zero,
@@ -57,7 +59,7 @@ class PlansPage extends StatelessWidget {
                 if (p['id'] == currentId)
                   const Text('Current plan')
                 else
-                  OutlinedButton(onPressed: () => _choose(context, p as Map), child: const Text('Switch')),
+                  OutlinedButton(onPressed: suspended ? null : () => _choose(context, p as Map), child: const Text('Switch')),
               ]),
             ),
         ]),
