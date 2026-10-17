@@ -9,8 +9,11 @@ const app = document.getElementById('app');
 const state = {
   token: null,
   staff: null,
-  view: 'requests', // requests | customers | issues | staff | account
+  view: 'overview', // overview | requests | customers | issues | staff | account
+  overview: null,
+  activity: { items: [], next: null, staff: [], actions: [], loaded: false }, activityFilter: { staff_id: '', action: '', q: '', since: '', until: '' },
   summary: { pending_requests: 0, open_issues: 0 },
+  remember: false, loginMode: 'signin', resetEmail: '', notice: null,
   q: '', searchKind: 'accounts', results: [], searched: false, // customers
   accountId: null, account: null, action: null, plans: [], // one customer's page, and which action panel is open
   issueFilter: 'OPEN', issues: { counts: { OPEN: 0, RESOLVED: 0 }, items: [] }, issueOpen: null,
@@ -86,44 +89,87 @@ async function api(path, { method = 'GET', body } = {}) {
 }
 
 // ---------- session ----------
-function saveSession(token, staff) {
+// "Keep me signed in" puts the token in localStorage (the server then makes it last 14 days); without it the token
+// lives in sessionStorage and is gone when the tab closes (the server makes that one last 12 hours).
+const EMAIL_KEY = 'np_staff_email'; // only saved when "keep me signed in" is ticked, to prefill the email box
+
+function readStored(storage, key) {
+  try { return window[storage].getItem(key); } catch { return null; }
+}
+
+function writeStored(storage, key, value) {
+  try {
+    if (value == null) window[storage].removeItem(key); else window[storage].setItem(key, value);
+  } catch { /* private mode or blocked storage: it just won't be remembered */ }
+}
+
+function saveSession(token, staff, remember) {
   state.token = token;
   state.staff = staff;
-  try { sessionStorage.setItem(TOKEN_KEY, token); } catch { /* private mode: fine, just not remembered */ }
+  state.remember = !!remember;
+  writeStored('sessionStorage', TOKEN_KEY, remember ? null : token);
+  writeStored('localStorage', TOKEN_KEY, remember ? token : null);
 }
 
 function signOut(message) {
   state.token = null;
   state.staff = null;
   state.open = null;
-  try { sessionStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ }
+  state.remember = false;
+  state.loginMode = 'signin';
+  writeStored('sessionStorage', TOKEN_KEY, null);
+  writeStored('localStorage', TOKEN_KEY, null); // a real sign-out forgets this device too
   state.error = message || null;
   render();
 }
 
-// ---------- sign in ----------
+// ---------- sign in / forgot password ----------
+const PASSWORD_HINT = '10+ characters, with a capital letter and a number.';
+
+function loginShell(title, subtitle, ...content) {
+  app.replaceChildren(h('div', { class: 'login-wrap' },
+    h('div', { class: 'login-card' },
+      h('div', { class: 'brand' }, h('span', { class: 'brand-mark' }), 'NetPulse'),
+      h('h1', {}, title),
+      h('p', {}, subtitle),
+      ...content)));
+}
+
+function errorBox(message) {
+  const box = h('div', { class: 'error', role: 'alert' }, message);
+  if (!message) box.classList.add('hidden');
+  return {
+    el: box,
+    show(text) { box.textContent = text; box.classList.remove('hidden'); },
+    hide() { box.classList.add('hidden'); },
+  };
+}
+
 function renderLogin() {
-  const email = h('input', { type: 'email', autocomplete: 'username', required: true, autofocus: true });
+  if (state.loginMode === 'forgot') return renderForgot();
+  if (state.loginMode === 'reset') return renderReset();
+  const email = h('input', { type: 'email', autocomplete: 'username', required: true, autofocus: true, value: readStored('localStorage', EMAIL_KEY) || '' });
   const password = h('input', { type: 'password', autocomplete: 'current-password', required: true });
-  const error = h('div', { class: 'error', role: 'alert' }, state.error);
-  if (!state.error) error.classList.add('hidden');
+  const keep = h('input', { type: 'checkbox', id: 'keep', checked: !!readStored('localStorage', EMAIL_KEY) });
+  const error = errorBox(state.error);
+  const notice = state.notice ? h('div', { class: 'notice', role: 'status' }, state.notice) : null;
   const submit = h('button', { class: 'btn primary block', type: 'submit' }, 'Sign in');
   const form = h('form', {
     onsubmit: async (e) => {
       e.preventDefault();
       submit.disabled = true;
-      error.classList.add('hidden');
+      error.hide();
       try {
-        const d = await api('/login', { method: 'POST', body: { email: email.value, password: password.value } });
-        state.error = null;
-        saveSession(d.token, d.staff);
-        state.view = 'requests';
+        const d = await api('/login', { method: 'POST', body: { email: email.value, password: password.value, remember: keep.checked } });
+        state.error = null; state.notice = null;
+        saveSession(d.token, d.staff, keep.checked);
+        writeStored('localStorage', EMAIL_KEY, keep.checked ? email.value.trim() : null);
+        state.view = 'overview';
         render();
-        loadRequests(true);
+        loadOverview(true);
         loadSummary();
       } catch (err) {
-        error.textContent = err.message;
-        error.classList.remove('hidden');
+        error.show(err.message);
         submit.disabled = false;
         password.value = '';
         password.focus();
@@ -132,14 +178,84 @@ function renderLogin() {
   },
   h('label', {}, 'Email'), email,
   h('label', {}, 'Password'), password,
-  error, submit);
-  app.replaceChildren(h('div', { class: 'login-wrap' },
-    h('div', { class: 'login-card' },
-      h('div', { class: 'brand' }, h('span', { class: 'brand-mark' }), 'NetPulse'),
-      h('h1', {}, 'Staff sign in'),
-      h('p', {}, 'For the service provider team.'),
-      form)));
-  state.error = null;
+  h('div', { class: 'login-extras' },
+    h('label', { class: 'check', for: 'keep' }, keep, 'Keep me signed in'),
+    h('button', { class: 'link-btn', type: 'button', onclick: () => { state.loginMode = 'forgot'; state.error = null; state.notice = null; state.resetEmail = email.value.trim(); render(); } }, 'Forgot password?')),
+  h('p', { class: 'muted hint' }, 'Keeps you signed in for 14 days. Only tick it on your own device.'),
+  error.el, submit);
+  loginShell('Staff sign in', 'For the service provider team.', notice, form);
+  state.error = null; state.notice = null;
+}
+
+function renderForgot() {
+  const email = h('input', { type: 'email', autocomplete: 'username', required: true, autofocus: true, value: state.resetEmail || '' });
+  const error = errorBox(null);
+  const submit = h('button', { class: 'btn primary block', type: 'submit' }, 'Email me a code');
+  const form = h('form', {
+    onsubmit: async (e) => {
+      e.preventDefault();
+      submit.disabled = true;
+      error.hide();
+      try {
+        await api('/forgot-password', { method: 'POST', body: { email: email.value } });
+        state.resetEmail = email.value.trim();
+        state.loginMode = 'reset';
+        state.notice = 'If that email belongs to a staff account, a 6-digit code is on its way. It works for 3 minutes.';
+        render();
+      } catch (err) {
+        error.show(err.message);
+        submit.disabled = false;
+      }
+    },
+  },
+  h('label', {}, 'Your staff email'), email, error.el, submit,
+  h('button', { class: 'btn block', type: 'button', onclick: () => { state.loginMode = 'signin'; render(); } }, 'Back to sign in'));
+  loginShell('Forgot your password?', "We'll email you a code to set a new one.", form);
+}
+
+function renderReset() {
+  const sub = state.notice; // shown once, as this screen's subtitle, so it can't reappear on the sign-in screen later
+  state.notice = null;
+  const code = h('input', { inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: '6', required: true, autofocus: true, placeholder: '6-digit code' });
+  const next = h('input', { type: 'password', autocomplete: 'new-password', required: true, minlength: '10' });
+  const again = h('input', { type: 'password', autocomplete: 'new-password', required: true });
+  const error = errorBox(null);
+  const submit = h('button', { class: 'btn primary block', type: 'submit' }, 'Set new password');
+  const resend = h('button', { class: 'link-btn', type: 'button', onclick: async () => {
+    resend.disabled = true;
+    try {
+      await api('/forgot-password', { method: 'POST', body: { email: state.resetEmail } });
+      error.hide();
+      toast('A new code is on its way.');
+    } catch (err) { error.show(err.message); }
+    setTimeout(() => { resend.disabled = false; }, 15000); // a short pause, so it can't be mashed
+  } }, 'Send a new code');
+  const form = h('form', {
+    onsubmit: async (e) => {
+      e.preventDefault();
+      error.hide();
+      if (next.value !== again.value) { error.show("The two passwords don't match."); again.value = ''; again.focus(); return; }
+      submit.disabled = true;
+      try {
+        await api('/reset-password', { method: 'POST', body: { email: state.resetEmail, code: code.value, new_password: next.value } });
+        state.loginMode = 'signin';
+        state.notice = 'Your password was changed. Sign in with the new one.';
+        render();
+      } catch (err) {
+        error.show(err.message);
+        submit.disabled = false;
+        if (/code/i.test(err.message)) { code.value = ''; code.focus(); }
+      }
+    },
+  },
+  h('label', {}, `Code sent to ${state.resetEmail}`), code,
+  h('label', {}, 'New password'), next,
+  h('p', { class: 'muted hint' }, PASSWORD_HINT),
+  h('label', {}, 'Type the new password again'), again,
+  error.el, submit,
+  h('div', { class: 'login-extras center' }, resend,
+    h('button', { class: 'link-btn', type: 'button', onclick: () => { state.loginMode = 'signin'; render(); } }, 'Back to sign in')));
+  loginShell('Enter your code', sub || 'Check your email for the 6-digit code.', form);
 }
 
 // ---------- shell ----------
@@ -148,9 +264,11 @@ function go(view) {
   state.open = null; state.action = null; state.issueOpen = null;
   if (view === 'customers') { state.accountId = null; state.account = null; }
   render();
+  if (view === 'overview') loadOverview(true);
   if (view === 'requests') loadRequests(true);
   if (view === 'issues') loadIssues(true);
   if (view === 'staff') loadStaff();
+  if (view === 'activity') loadActivity(true);
   loadSummary();
 }
 
@@ -161,11 +279,13 @@ function renderShell(content) {
     onclick: () => go(view),
   }, label, extra);
   const nav = h('nav', { class: 'nav' },
-    tab('requests', 'Link requests', badge('pending_requests')),
+    tab('overview', 'Overview'),
+    tab('requests', 'Requests', badge('pending_requests')),
     tab('customers', 'Customers'),
     tab('issues', 'Issues', badge('open_issues')),
+    state.staff.role === 'admin' ? tab('activity', 'Activity') : null,
     state.staff.role === 'admin' ? tab('staff', 'Staff') : null,
-    tab('account', 'My account'));
+    tab('account', 'Account'));
   const top = h('header', { class: 'topbar' }, h('div', { class: 'topbar-inner' },
     h('div', { class: 'brand' }, h('span', { class: 'brand-mark' }), 'NetPulse Staff'),
     nav,
@@ -231,34 +351,36 @@ function requestCard(r) {
   if (r.status === 'PENDING') {
     const open = state.open && state.open.id === r.id ? state.open.mode : null;
     const reason = h('textarea', { maxlength: '200', placeholder: 'Reason (optional). The customer sees it in the email and in the app.' });
-    const act = async (path, payload, okMsg, btn) => {
-      btn.disabled = true;
+    // Both decisions end in the password pop-up (defined in ops.js); an "already decided" answer refreshes the queue.
+    const decide = (path, payload, okMsg) => async (password) => {
       try {
-        await api(`/link-requests/${r.id}/${path}`, { method: 'POST', body: payload });
-        state.open = null;
-        toast(okMsg);
-        await loadRequests();
+        await api(`/link-requests/${r.id}/${path}`, { method: 'POST', body: { ...payload, password } });
       } catch (err) {
-        btn.disabled = false;
-        if (err.message !== 'signed out') toast(err.message);
-        if (/already/.test(err.message)) { state.open = null; await loadRequests(); }
+        if (/already/.test(err.message)) { state.open = null; loadRequests(true); }
+        throw err;
       }
+      state.open = null;
+      toast(okMsg);
+      await loadRequests();
     };
+    const askApprove = () => passwordModal({
+      title: 'Confirm: approve link request', confirmLabel: 'Approve',
+      detail: `Link ${r.account.account_no} (${r.account.holder_name}) to ${r.requester.email}. They will be able to see its bills and pay them.`,
+      run: decide('approve', {}, 'Approved. The customer was notified.'),
+    });
+    const askDecline = () => passwordModal({
+      title: 'Confirm: decline link request', confirmLabel: 'Decline', danger: true,
+      detail: `Decline ${r.requester.email}'s request for ${r.account.account_no}.${reason.value.trim() ? ` Reason: ${reason.value.trim()}` : ''}`,
+      run: decide('reject', { reason: reason.value }, 'Declined. The customer was notified.'),
+    });
     if (!open) {
       body.push(h('div', { class: 'actions' },
-        h('button', { class: 'btn primary', onclick: () => { state.open = { id: r.id, mode: 'approve' }; render(); } }, 'Approve'),
+        h('button', { class: 'btn primary', onclick: askApprove }, 'Approve'),
         h('button', { class: 'btn danger', onclick: () => { state.open = { id: r.id, mode: 'decline' }; render(); } }, 'Decline')));
-    } else if (open === 'approve') {
-      const go = h('button', { class: 'btn primary', onclick: () => act('approve', null, 'Approved. The customer was notified.', go) },
-        'Yes, link this account');
-      body.push(h('p', {}, `Link ${r.account.account_no} (${r.account.holder_name}) to ${r.requester.email}? They will be able to see the bills and make payments for it.`),
-        h('div', { class: 'actions' }, go,
-          h('button', { class: 'btn', onclick: () => { state.open = null; render(); } }, 'Back')));
     } else {
-      const go = h('button', { class: 'btn danger solid', onclick: () => act('reject', { reason: reason.value }, 'Declined. The customer was notified.', go) },
-        'Decline request');
       body.push(h('div', { class: 'decline-form' }, reason,
-        h('div', { class: 'actions mt-s' }, go,
+        h('div', { class: 'actions mt-s' },
+          h('button', { class: 'btn danger solid', onclick: askDecline }, 'Decline request'),
           h('button', { class: 'btn', onclick: () => { state.open = null; render(); } }, 'Back'))));
     }
   } else {
@@ -356,8 +478,8 @@ function viewAccount() {
       e.preventDefault();
       if (next.value !== again.value) return toast("The new passwords don't match.");
       try {
-        const d = await api('/me/password', { method: 'POST', body: { current_password: current.value, new_password: next.value } });
-        saveSession(d.token, state.staff);
+        const d = await api('/me/password', { method: 'POST', body: { current_password: current.value, new_password: next.value, remember: state.remember } });
+        saveSession(d.token, state.staff, state.remember);
         current.value = next.value = again.value = '';
         toast('Password changed.');
       } catch (err) { if (err.message !== 'signed out') toast(err.message); }
@@ -380,24 +502,28 @@ function viewAccount() {
 // ---------- render loop ----------
 function render() {
   if (!state.token) return renderLogin();
-  const view = state.view === 'staff' && state.staff.role !== 'admin' ? 'requests' : state.view;
-  const views = { requests: viewRequests, customers: viewCustomers, issues: viewIssues, staff: viewStaff, account: viewAccount };
-  renderShell((views[view] || viewRequests)());
+  const adminOnly = state.view === 'staff' || state.view === 'activity';
+  const view = adminOnly && state.staff.role !== 'admin' ? 'overview' : state.view;
+  const views = { overview: viewOverview, requests: viewRequests, customers: viewCustomers, issues: viewIssues, activity: viewActivity, staff: viewStaff, account: viewAccount };
+  renderShell((views[view] || viewOverview)());
 }
 
 async function start() {
-  try { state.token = sessionStorage.getItem(TOKEN_KEY); } catch { state.token = null; }
+  state.token = readStored('sessionStorage', TOKEN_KEY);
+  state.remember = false;
+  if (!state.token) { state.token = readStored('localStorage', TOKEN_KEY); state.remember = !!state.token; }
   if (state.token) {
     try { state.staff = await api('/me'); } catch { state.token = null; }
   }
   render();
-  if (state.token) { loadRequests(true); loadSummary(); }
+  if (state.token) { loadOverview(true); loadRequests(true); loadSummary(); }
 }
 
 // New requests and reports show up on their own while their queue is on screen.
 setInterval(() => {
   if (!state.token || document.hidden) return;
   loadSummary();
+  if (state.view === 'overview') loadOverview(true);
   if (state.view === 'requests') loadRequests(true);
   if (state.view === 'issues' && !state.issueOpen) loadIssues(true);
 }, 30000);

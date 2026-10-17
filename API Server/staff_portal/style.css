@@ -234,3 +234,48 @@ table.compact th, table.compact td { padding: 8px 10px; }
 .modal .hint { margin: 8px 0 0; }
 .modal .error { margin-top: 12px; }
 .modal-actions { justify-content: flex-end; }
+
+/* sign-in extras */
+.login-extras { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 14px; }
+.login-extras.center { justify-content: center; gap: 20px; }
+label.check { display: inline-flex; align-items: center; gap: 8px; margin: 0; font-weight: 500; font-size: 14px; cursor: pointer; }
+label.check input { width: 16px; height: 16px; padding: 0; accent-color: var(--brand); }
+.login-card .hint { margin: 8px 0 0; font-size: 13px; }
+.login-card .btn.block + .btn.block { margin-top: 10px; }
+.notice { background: var(--good-soft); color: var(--good); padding: 10px 12px; border-radius: 10px; margin: 0 0 14px; font-weight: 600; }
+
+/* ---------- overview ---------- */
+.tiles-title { font-size: 13px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin: 20px 0 10px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; }
+.tile {
+  display: flex; flex-direction: column; gap: 4px; text-align: left; font: inherit; color: inherit;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; box-shadow: var(--shadow);
+}
+.tile.click { cursor: pointer; }
+.tile.click:hover { border-color: var(--brand); }
+.tile-label { color: var(--muted); font-size: 13px; font-weight: 600; }
+.tile-value { font-size: 28px; font-weight: 800; line-height: 1.15; overflow-wrap: anywhere; }
+.tile-sub { color: var(--muted); font-size: 13px; }
+.tile.alert { border-color: var(--warn); background: var(--warn-soft); }
+.tile.alert .tile-value { color: var(--warn); }
+.tile.calm .tile-value { color: var(--good); }
+.feed-row { display: flex; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.feed-row:last-child { border-bottom: 0; }
+.feed-meta { font-size: 13px; white-space: nowrap; }
+
+/* six tabs now: keep them on one row on normal screens, and keep account links on one line */
+.nav button { padding: 8px 10px; }
+.nav { gap: 2px; }
+.link-btn { text-align: left; white-space: nowrap; }
+table.compact td strong { white-space: nowrap; }
+
+/* ---------- activity ---------- */
+.filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; margin-bottom: 14px; }
+.filters input[type=search] { grid-column: span 2; }
+.date-field { display: flex; flex-direction: column; gap: 4px; margin: 0; font-size: 12px; font-weight: 600; color: var(--muted); }
+.nowrap { white-space: nowrap; }
+.more-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 12px; }
+@media (max-width: 640px) { .filters input[type=search] { grid-column: 1 / -1; } }
+
+.filters { grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); }
+@media (max-width: 640px) { .nowrap { white-space: normal; } }

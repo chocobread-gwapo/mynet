@@ -28,7 +28,7 @@ from google.oauth2 import id_token as google_id_token
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
-from sqlalchemy import ForeignKey, String, create_engine, select
+from sqlalchemy import ForeignKey, String, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 # Anchored to this file's own folder, not the current working directory — otherwise running via
@@ -863,6 +863,7 @@ def dismiss_link_request(request_id: int, user: User = Depends(current_user), db
 # customer's token never works here and a staff token never works in the customer app. The dashboard itself is
 # the static page in the staff_portal folder, served at /staff/.
 STAFF_TOKEN_HOURS = 12
+STAFF_REMEMBER_DAYS = 14  # "keep me signed in": a longer session on a device the person trusts
 STAFF_ROLES = ("admin", "support")  # admin: everything, including managing staff; support: day-to-day requests
 
 
@@ -877,8 +878,9 @@ def _staff_pw_version(staff: Staff) -> str:
     return hashlib.sha256(staff.password_hash.encode()).hexdigest()[:16]
 
 
-def make_staff_token(staff: Staff) -> str:
-    exp = datetime.now(timezone.utc) + timedelta(hours=STAFF_TOKEN_HOURS)
+def make_staff_token(staff: Staff, remember: bool = False) -> str:
+    lifetime = timedelta(days=STAFF_REMEMBER_DAYS) if remember else timedelta(hours=STAFF_TOKEN_HOURS)
+    exp = datetime.now(timezone.utc) + lifetime
     return jwt.encode({"sub": str(staff.id), "typ": "staff", "exp": exp, "pv": _staff_pw_version(staff)},
                       JWT_SECRET, algorithm="HS256")
 
@@ -917,6 +919,7 @@ def _staff_password_problem(pw: str) -> str | None:
 class StaffLoginBody(BaseModel):
     email: str
     password: str
+    remember: bool = False
 
 
 @app.post("/api/v1/staff/login")
@@ -928,7 +931,10 @@ def staff_login(body: StaffLoginBody, request: Request, db: Session = Depends(ge
     # The same answer for an unknown email, a wrong password and a deactivated person.
     if not staff or not staff.active or not check_pw(body.password, staff.password_hash):
         raise HTTPException(401, "Wrong email or password")
-    return {"token": make_staff_token(staff), "staff": _staff_view(staff)}
+    _audit(db, staff, None, "LOGIN", f"From {request.client.host if request.client else 'unknown'}"
+                                     + (", kept signed in" if body.remember else ""))
+    db.commit()
+    return {"token": make_staff_token(staff, body.remember), "staff": _staff_view(staff)}
 
 
 @app.get("/api/v1/staff/me")
@@ -939,20 +945,101 @@ def staff_me(staff: Staff = Depends(current_staff)):
 class StaffPasswordBody(BaseModel):
     current_password: str
     new_password: str
+    remember: bool = False  # keep the same kind of session the person already has
 
 
 @app.post("/api/v1/staff/me/password")
 def staff_change_password(body: StaffPasswordBody, staff: Staff = Depends(current_staff),
                           db: Session = Depends(get_db)):
-    rate_limit(f"staff-pw:{staff.id}")
+    rate_limit(f"staff-chpw:{staff.id}")
     if not check_pw(body.current_password, staff.password_hash):
         raise HTTPException(403, "Your current password is wrong")  # 403, never 401: the dashboard treats 401 as "signed out"
     problem = _staff_password_problem(body.new_password)
     if problem:
         raise HTTPException(422, problem)
     staff.password_hash = hash_pw(body.new_password)
+    _audit(db, staff, None, "CHANGE_PASSWORD", "Changed their own password")
     db.commit()
-    return {"token": make_staff_token(staff)}  # the old token stopped working with the old password
+    return {"token": make_staff_token(staff, body.remember)}  # the old token stopped working with the old password
+
+
+# ----- forgotten password (emailed one-time code) -----
+# Staff can reset money-moving accounts, so this is stricter than the customer version: the answer is the same
+# whether or not the email belongs to staff (nothing to probe), a code is good for 3 minutes, and five wrong guesses
+# burn it. Codes live apart from the customer ones, so one kind can never be used for the other.
+_pending_staff_reset: dict[str, dict] = {}
+STAFF_RESET_MAX_GUESSES = 5
+
+
+class StaffForgotBody(BaseModel):
+    email: str
+
+
+class StaffResetBody(BaseModel):
+    email: str
+    code: str
+    new_password: str
+
+
+def _send_staff_reset_email(email: str, code: str) -> None:
+    try:
+        _deliver_email_code(
+            email, code, subject="Reset your NetPulse staff password",
+            message=f"Your NetPulse staff password reset code is {code}. It expires in 3 minutes.\n\n"
+                    "If you didn't ask to reset your password, ignore this email and tell an admin.")
+    except HTTPException as e:
+        print(f"[staff password reset] could not email {email}: {e.detail}")
+
+
+@app.post("/api/v1/staff/forgot-password")
+def staff_forgot_password(body: StaffForgotBody, request: Request, background: BackgroundTasks,
+                          db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    rate_limit(f"staff-forgot:{email}", max_attempts=3)
+    rate_limit(f"staff-forgot-ip:{request.client.host if request.client else '?'}", max_attempts=10)
+    staff = db.scalar(select(Staff).where(Staff.email == email))
+    if staff and staff.active:
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        _pending_staff_reset[email] = {"code": code, "expires": time.time() + OTP_TTL_SECONDS, "guesses": 0}
+        if SMTP_USERNAME:
+            background.add_task(_send_staff_reset_email, email, code)
+        else:
+            print(f"[staff password reset] code for {email}: {code}")  # dev-mode fallback: no email provider yet
+    return {"ok": True}  # identical for unknown, deactivated and real staff
+
+
+@app.post("/api/v1/staff/reset-password")
+def staff_reset_password(body: StaffResetBody, request: Request, background: BackgroundTasks,
+                         db: Session = Depends(get_db)):
+    email = body.email.strip().lower()
+    rate_limit(f"staff-reset:{email}", max_attempts=10)
+    rate_limit(f"staff-reset-ip:{request.client.host if request.client else '?'}", max_attempts=30)
+    problem = _staff_password_problem(body.new_password)
+    if problem:
+        raise HTTPException(422, problem)
+    pending = _pending_staff_reset.get(email)
+    staff = db.scalar(select(Staff).where(Staff.email == email))
+    bad = HTTPException(401, "Incorrect or expired code")
+    if not pending or not staff or not staff.active:
+        raise bad
+    if time.time() >= pending["expires"]:
+        _pending_staff_reset.pop(email, None)
+        raise bad
+    if not hmac.compare_digest(pending["code"], body.code.strip()):
+        pending["guesses"] += 1
+        if pending["guesses"] >= STAFF_RESET_MAX_GUESSES:
+            _pending_staff_reset.pop(email, None)  # too many wrong guesses: they must ask for a new code
+        raise bad
+    _pending_staff_reset.pop(email, None)  # one use only
+    staff.password_hash = hash_pw(body.new_password)  # signs out every session of theirs (see _staff_pw_version)
+    _audit(db, staff, None, "RESET_PASSWORD", "Staff password reset by emailed code")
+    db.commit()
+    _queue_notices(background, label="staff password reset", email=staff.email, mobiles=[],
+                   subject="Your NetPulse staff password was changed",
+                   email_text=f"The password for your NetPulse staff account was just changed ({_ph_time_text()}).\n\n"
+                              "If this was you, no action is needed. If it wasn't, tell an admin right away.",
+                   sms_text="")
+    return {"ok": True}
 
 
 # ----- link requests -----
@@ -1007,7 +1094,12 @@ def staff_list_link_requests(status: str = "PENDING", staff: Staff = Depends(cur
 
 
 class DecisionBody(BaseModel):
+    password: str  # deciding a request gives (or refuses) someone access to an account's bills, so it asks like money actions do
     reason: str | None = None
+
+
+class ApproveBody(BaseModel):
+    password: str
 
 
 def _decide_link_request(request_id: int, approve: bool, reason: str | None, staff: Staff,
@@ -1024,6 +1116,8 @@ def _decide_link_request(request_id: int, approve: bool, reason: str | None, sta
     req.status = "APPROVED" if approve else "REJECTED"
     req.decided_by, req.decided_at = staff.id, datetime.now(timezone.utc)
     req.reason = None if approve else reason
+    _audit(db, staff, acct.id, "APPROVE_LINK" if approve else "REJECT_LINK",
+           f"{user.email}" + (f". Reason: {reason}" if reason and not approve else ""))
     db.commit()
     verdict = "approved" if approve else "declined"
     text = f"Your request to link account {acct.account_no} to NetPulse was {verdict}."
@@ -1037,14 +1131,16 @@ def _decide_link_request(request_id: int, approve: bool, reason: str | None, sta
 
 
 @app.post("/api/v1/staff/link-requests/{request_id}/approve")
-def staff_approve_link(request_id: int, background: BackgroundTasks, staff: Staff = Depends(current_staff),
-                       db: Session = Depends(get_db)):
+def staff_approve_link(request_id: int, body: ApproveBody, background: BackgroundTasks,
+                       staff: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    _require_staff_password(staff, body.password)
     return _decide_link_request(request_id, True, None, staff, background, db)
 
 
 @app.post("/api/v1/staff/link-requests/{request_id}/reject")
 def staff_reject_link(request_id: int, body: DecisionBody, background: BackgroundTasks,
                       staff: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    _require_staff_password(staff, body.password)
     return _decide_link_request(request_id, False, body.reason, staff, background, db)
 
 
@@ -1068,7 +1164,7 @@ def list_staff(_: Staff = Depends(admin_only), db: Session = Depends(get_db)):
 
 
 @app.post("/api/v1/staff/staff", status_code=201)
-def create_staff(body: NewStaffBody, _: Staff = Depends(admin_only), db: Session = Depends(get_db)):
+def create_staff(body: NewStaffBody, me: Staff = Depends(admin_only), db: Session = Depends(get_db)):
     email = body.email.strip().lower()
     if "@" not in email or not body.name.strip():
         raise HTTPException(422, "Enter a name and a valid email")
@@ -1081,6 +1177,8 @@ def create_staff(body: NewStaffBody, _: Staff = Depends(admin_only), db: Session
         raise HTTPException(409, "A staff member with that email already exists")
     s = Staff(email=email, name=body.name.strip(), role=body.role, password_hash=hash_pw(body.password))
     db.add(s)
+    db.flush()
+    _audit(db, me, None, "CREATE_STAFF", f"{s.name} ({s.email}) as {s.role}")
     db.commit()
     return _staff_view(s)
 
@@ -1095,15 +1193,23 @@ def update_staff(staff_id: int, body: UpdateStaffBody, me: Staff = Depends(admin
         raise HTTPException(422, "Role must be admin or support")
     if s.id == me.id and ((body.role and body.role != "admin") or body.active is False):
         raise HTTPException(409, "You can't demote or deactivate yourself")
+    changes = []
     if body.new_password is not None:
         problem = _staff_password_problem(body.new_password)
         if problem:
             raise HTTPException(422, problem)
         s.password_hash = hash_pw(body.new_password)  # signs that person out everywhere
+        changes.append("password set")
     if body.role is not None:
+        if body.role != s.role:
+            changes.append(f"role {s.role} to {body.role}")
         s.role = body.role
     if body.active is not None:
+        if body.active != s.active:
+            changes.append("reactivated" if body.active else "deactivated")
         s.active = body.active
+    if changes:
+        _audit(db, me, None, "UPDATE_STAFF", f"{s.name} ({s.email}): " + ", ".join(changes))
     db.commit()
     return _staff_view(s)
 
@@ -1148,6 +1254,58 @@ def _notify_account(db: Session, acct: Account, title: str, body: str) -> None:
 
 def _like(q: str) -> str:
     return "%" + q.strip().replace("%", "").replace("_", "") + "%"
+
+
+@app.get("/api/v1/staff/overview")
+def staff_overview(_: Staff = Depends(current_staff), db: Session = Depends(get_db)):
+    """Everything on the dashboard's home page in one call. Money is whole centavos; "today" and "this month"
+    follow Philippine time, since that is where the people reading it are."""
+    ph = timezone(timedelta(hours=8))
+    now_ph = datetime.now(ph)
+    today = now_ph.date()
+    day_start = now_ph.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).replace(tzinfo=None)
+    month_start = now_ph.replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).replace(tzinfo=None)
+
+    def one(stmt):
+        return db.execute(stmt).one()
+
+    total, = one(select(func.count(Account.id)))
+    suspended, = one(select(func.count(Account.id)).where(Account.status == "SUSPENDED"))
+    owing_n, owing_sum = one(select(func.count(Account.id), func.coalesce(func.sum(Account.balance), 0)).where(Account.balance > 0))
+    credit_n, credit_sum = one(select(func.count(Account.id), func.coalesce(func.sum(Account.balance), 0)).where(Account.balance < 0))
+    late_n, late_sum = one(select(func.count(Account.id), func.coalesce(func.sum(Account.balance), 0))
+                           .where(Account.balance > 0, Account.due_date < today))
+
+    def collected(since):
+        n, amount = one(select(func.count(Payment.id), func.coalesce(func.sum(Payment.amount), 0))
+                        .where(Payment.status == "PAID", Payment.paid_at >= since))
+        return {"count": n, "amount": amount}
+
+    pending_n, oldest_pending = one(select(func.count(LinkRequest.id), func.min(LinkRequest.created_at))
+                                    .where(LinkRequest.status == "PENDING"))
+    open_n, oldest_open = one(select(func.count(Issue.id), func.min(Issue.created_at)).where(Issue.status == "OPEN"))
+    logins, = one(select(func.count(User.id)))
+
+    top = db.scalars(select(Account).where(Account.balance > 0).order_by(Account.balance.desc()).limit(5)).all()
+    acts = db.execute(select(StaffAction, Staff, Account.account_no)
+                      .join(Staff, Staff.id == StaffAction.staff_id)
+                      .outerjoin(Account, Account.id == StaffAction.account_id)
+                      .order_by(StaffAction.id.desc()).limit(8)).all()
+    return {
+        "accounts": {"total": total, "active": total - suspended, "suspended": suspended, "logins": logins},
+        "pending_requests": {"count": pending_n, "oldest": _iso(oldest_pending)},
+        "open_issues": {"count": open_n, "oldest": _iso(oldest_open)},
+        "outstanding": {"amount": owing_sum, "accounts": owing_n},
+        "credit": {"amount": -credit_sum, "accounts": credit_n},
+        "overdue": {"amount": late_sum, "accounts": late_n},
+        "collected_month": collected(month_start),
+        "collected_today": collected(day_start),
+        "top_owing": [{"id": a.id, "account_no": a.account_no, "holder_name": a.holder_name, "balance": a.balance,
+                       "due_date": a.due_date.isoformat(), "overdue": a.due_date < today} for a in top],
+        "recent_activity": [{"action": x.action, "detail": x.detail, "by": st.name, "account_no": no,
+                             "account_id": x.account_id, "at": _iso(x.created_at)} for x, st, no in acts],
+        "as_of": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
 
 
 @app.get("/api/v1/staff/summary")
@@ -1484,6 +1642,49 @@ def staff_reopen_issue(issue_id: int, staff: Staff = Depends(current_staff), db:
     _audit(db, staff, a.id, "REOPEN_ISSUE", f"#{issue.id}")
     db.commit()
     return _issue_view(issue, a, db)
+
+
+# ----- activity log (admins only) -----
+ACTIVITY_PAGE = 50
+
+
+@app.get("/api/v1/staff/activity")
+def staff_activity(staff_id: int | None = None, action: str | None = None, q: str | None = None,
+                   since: date | None = None, until: date | None = None, before_id: int | None = None,
+                   _: Staff = Depends(admin_only), db: Session = Depends(get_db)):
+    """Everything staff have done, newest first, 50 at a time (pass the last id as before_id for the next page).
+    Dates are Philippine calendar days, and `until` includes that whole day."""
+    ph = timezone(timedelta(hours=8))
+
+    def utc_start(d: date) -> datetime:
+        return datetime.combine(d, datetime.min.time(), tzinfo=ph).astimezone(timezone.utc).replace(tzinfo=None)
+
+    stmt = (select(StaffAction, Staff, Account.account_no)
+            .join(Staff, Staff.id == StaffAction.staff_id)
+            .outerjoin(Account, Account.id == StaffAction.account_id))
+    if staff_id:
+        stmt = stmt.where(StaffAction.staff_id == staff_id)
+    if action:
+        stmt = stmt.where(StaffAction.action == action)
+    if q and q.strip():
+        like = _like(q)
+        stmt = stmt.where(StaffAction.detail.ilike(like) | Account.account_no.ilike(like) | Staff.name.ilike(like))
+    if since:
+        stmt = stmt.where(StaffAction.created_at >= utc_start(since))
+    if until:
+        stmt = stmt.where(StaffAction.created_at < utc_start(until + timedelta(days=1)))
+    if before_id:
+        stmt = stmt.where(StaffAction.id < before_id)
+    rows = db.execute(stmt.order_by(StaffAction.id.desc()).limit(ACTIVITY_PAGE + 1)).all()
+    more = len(rows) > ACTIVITY_PAGE
+    rows = rows[:ACTIVITY_PAGE]
+    return {
+        "items": [{"id": x.id, "action": x.action, "detail": x.detail, "by": st.name, "staff_id": st.id,
+                   "account_id": x.account_id, "account_no": no, "at": _iso(x.created_at)} for x, st, no in rows],
+        "next_before_id": rows[-1][0].id if more else None,
+        "staff": [{"id": st.id, "name": st.name} for st in db.scalars(select(Staff).order_by(Staff.name))],
+        "actions": sorted(db.scalars(select(StaffAction.action).distinct()).all()),
+    }
 
 
 # ----- the dashboard page itself -----

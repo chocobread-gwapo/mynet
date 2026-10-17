@@ -31,6 +31,9 @@ const ACTION_LABELS = {
   ISSUE_BILL: 'Issued a bill', CHANGE_PLAN: 'Changed the plan', SUSPEND: 'Suspended service',
   REACTIVATE: 'Restored service', EDIT_CONTACT: 'Edited account details', UNLINK_LOGIN: 'Unlinked a login',
   RESOLVE_ISSUE: 'Resolved a report', REOPEN_ISSUE: 'Reopened a report',
+  APPROVE_LINK: 'Approved a link request', REJECT_LINK: 'Declined a link request',
+  CREATE_STAFF: 'Added a staff member', UPDATE_STAFF: 'Changed a staff member',
+  CHANGE_PASSWORD: 'Changed their password', RESET_PASSWORD: 'Reset their password', LOGIN: 'Signed in',
 };
 
 // ---------- customers: search ----------
@@ -460,4 +463,154 @@ function viewIssues() {
     state.error ? h('div', { class: 'error' }, state.error) : null,
     items.length ? items.map(issueCard)
       : h('div', { class: 'empty' }, state.issueFilter === 'OPEN' ? 'No open reports. Nice.' : 'Nothing resolved yet.'));
+}
+
+
+// ---------- overview (the home page) ----------
+async function loadOverview(quiet) {
+  try {
+    state.overview = await api('/overview');
+    state.summary.pending_requests = state.overview.pending_requests.count;
+    state.summary.open_issues = state.overview.open_issues.count;
+    state.error = null;
+  } catch (err) {
+    if (err.message === 'signed out') return;
+    state.error = err.message;
+    if (!quiet) toast(err.message);
+  }
+  if (state.view === 'overview') render();
+  else updateBadges();
+}
+
+function waiting(iso) {
+  return iso ? `Oldest waiting ${ago(iso).replace(' ago', '')}` : 'Nothing waiting';
+}
+
+function tile({ label, value, sub, tone, onclick }) {
+  return h(onclick ? 'button' : 'div', { class: `tile${tone ? ` ${tone}` : ''}${onclick ? ' click' : ''}`, type: onclick ? 'button' : null, onclick },
+    h('span', { class: 'tile-label' }, label),
+    h('span', { class: 'tile-value' }, value),
+    sub ? h('span', { class: 'tile-sub' }, sub) : null);
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+function viewOverview() {
+  const o = state.overview;
+  if (!o) return h('div', {}, h('div', { class: 'page-title' }, h('h2', {}, 'Overview')), state.error ? h('div', { class: 'error' }, state.error) : h('div', { class: 'empty' }, 'Loading...'));
+  const pr = o.pending_requests, oi = o.open_issues;
+  const tiles = (title, items) => h('section', {}, h('h3', { class: 'tiles-title' }, title), h('div', { class: 'tiles' }, items));
+
+  const owing = o.top_owing.length
+    ? h('div', { class: 'table-wrap flat' }, h('table', { class: 'compact' },
+      h('thead', {}, h('tr', {}, ['Account', 'Holder', 'Due', 'Owes'].map((t) => h('th', {}, t)))),
+      h('tbody', {}, o.top_owing.map((a) => h('tr', { class: 'click', onclick: () => openAccount(a.id) },
+        h('td', {}, h('button', { class: 'link-btn', onclick: (e) => { e.stopPropagation(); openAccount(a.id); } }, a.account_no)),
+        h('td', {}, a.holder_name),
+        h('td', {}, fmtDate(a.due_date), a.overdue ? ' ' : null, a.overdue ? chip('bad', 'Overdue') : null),
+        h('td', {}, h('strong', {}, money(a.balance))))))))
+    : h('p', { class: 'muted flush' }, 'Nobody owes anything right now.');
+
+  const activity = o.recent_activity.length
+    ? h('div', {}, o.recent_activity.map((x) => h('div', { class: 'feed-row' },
+      h('div', {}, h('strong', {}, ACTION_LABELS[x.action] || x.action),
+        x.account_no ? h('span', {}, ' on ', h('button', { class: 'link-btn', onclick: () => openAccount(x.account_id) }, x.account_no)) : null,
+        x.detail ? h('div', { class: 'muted' }, x.detail) : null),
+      h('div', { class: 'muted feed-meta', title: fmtTime(x.at) }, `${x.by} · ${ago(x.at)}`))))
+    : h('p', { class: 'muted flush' }, 'Nothing done from the dashboard yet.');
+
+  return h('div', {},
+    h('div', { class: 'page-title' }, h('h2', {}, 'Overview'), h('span', { class: 'muted', title: fmtTime(o.as_of) }, `Updated ${ago(o.as_of)}`)),
+    state.error ? h('div', { class: 'error' }, state.error) : null,
+    tiles('Needs attention', [
+      tile({ label: 'Link requests waiting', value: pr.count, sub: waiting(pr.oldest), tone: pr.count ? 'alert' : 'calm', onclick: () => go('requests') }),
+      tile({ label: 'Open issues', value: oi.count, sub: waiting(oi.oldest), tone: oi.count ? 'alert' : 'calm', onclick: () => go('issues') }),
+      tile({ label: 'Overdue', value: money(o.overdue.amount), sub: plural(o.overdue.accounts, 'account') + ' past their due date', tone: o.overdue.accounts ? 'alert' : 'calm' }),
+    ]),
+    tiles('Money', [
+      tile({ label: 'Total outstanding', value: money(o.outstanding.amount), sub: `Owed by ${plural(o.outstanding.accounts, 'account')}` }),
+      tile({ label: 'Collected this month', value: money(o.collected_month.amount), sub: `${plural(o.collected_month.count, 'payment')} · ${money(o.collected_today.amount)} today` }),
+      tile({ label: 'Customer credit', value: money(o.credit.amount), sub: `Held on ${plural(o.credit.accounts, 'account')}` }),
+    ]),
+    tiles('Customers', [
+      tile({ label: 'Accounts', value: o.accounts.total, sub: `${o.accounts.active} active · ${o.accounts.suspended} suspended`, onclick: () => go('customers') }),
+      tile({ label: 'App logins', value: o.accounts.logins, sub: 'People with a NetPulse login' }),
+    ]),
+    h('div', { class: 'cols' },
+      h('section', { class: 'card' }, h('h3', {}, 'Biggest balances'), owing),
+      h('section', { class: 'card' }, h('h3', {}, 'Recent staff activity'), activity)));
+}
+
+
+// ---------- activity log (admins) ----------
+function activityQuery(extra) {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries({ ...state.activityFilter, ...extra })) if (v) params.set(k, v);
+  return params.toString();
+}
+
+// Loads the first page (or, with `more`, the next one). The filter bar is built once and left alone, so typing in
+// it never loses focus: only the list underneath is repainted.
+let activitySeq = 0;
+
+async function loadActivity(quiet, more) {
+  const a = state.activity;
+  const mine = ++activitySeq; // if the filters change while a request is in flight, the older answer is thrown away
+  try {
+    const d = await api(`/activity?${activityQuery(more && a.next ? { before_id: a.next } : {})}`);
+    if (mine !== activitySeq) return;
+    a.items = more ? a.items.concat(d.items) : d.items;
+    a.next = d.next_before_id;
+    a.staff = d.staff;
+    a.actions = d.actions;
+    state.error = null;
+  } catch (err) {
+    if (err.message === 'signed out') return;
+    if (!quiet) toast(err.message); else state.error = err.message;
+  }
+  const first = !a.loaded;
+  a.loaded = true;
+  if (state.view !== 'activity') return;
+  if (first) render(); else paintActivity();
+}
+
+function paintActivity() {
+  const box = document.getElementById('activity-list');
+  if (!box) return;
+  const a = state.activity;
+  if (!a.items.length) { box.replaceChildren(h('div', { class: 'empty' }, 'No activity matches those filters.')); return; }
+  const table = h('div', { class: 'table-wrap' }, h('table', { class: 'compact' },
+    h('thead', {}, h('tr', {}, ['When', 'Who', 'What', 'Account'].map((t) => h('th', {}, t)))),
+    h('tbody', {}, a.items.map((x) => h('tr', {},
+      h('td', { class: 'nowrap' }, fmtTime(x.at)),
+      h('td', {}, x.by),
+      h('td', {}, h('strong', {}, ACTION_LABELS[x.action] || x.action), x.detail ? h('div', { class: 'muted' }, x.detail) : null),
+      h('td', {}, x.account_id ? h('button', { class: 'link-btn', onclick: () => openAccount(x.account_id) }, x.account_no) : h('span', { class: 'muted' }, '-')))))));
+  box.replaceChildren(table,
+    h('div', { class: 'more-row' },
+      h('span', { class: 'muted' }, `Showing ${a.items.length}${a.next ? '+' : ''} ${a.items.length === 1 ? 'entry' : 'entries'}`),
+      a.next ? h('button', { class: 'btn', onclick: (e) => { e.target.disabled = true; loadActivity(false, true); } }, 'Load more') : null));
+}
+
+function viewActivity() {
+  const a = state.activity, f = state.activityFilter;
+  const reload = () => loadActivity(false);
+  const staffSel = h('select', { 'aria-label': 'Staff member', onchange: () => { f.staff_id = staffSel.value; reload(); } },
+    h('option', { value: '' }, 'All staff'),
+    a.staff.map((x) => h('option', { value: x.id, selected: String(x.id) === String(f.staff_id) }, x.name)));
+  const actSel = h('select', { 'aria-label': 'Type of action', onchange: () => { f.action = actSel.value; reload(); } },
+    h('option', { value: '' }, 'All actions'),
+    a.actions.map((x) => h('option', { value: x, selected: x === f.action }, ACTION_LABELS[x] || x)));
+  const search = h('input', { type: 'search', placeholder: 'Search account number or details', value: f.q, autocomplete: 'off', 'aria-label': 'Search' });
+  let timer;
+  search.addEventListener('input', () => { f.q = search.value; clearTimeout(timer); timer = setTimeout(reload, 300); });
+  const since = h('input', { type: 'date', value: f.since, 'aria-label': 'From date', onchange: () => { f.since = since.value; reload(); } });
+  const until = h('input', { type: 'date', value: f.until, 'aria-label': 'To date', onchange: () => { f.until = until.value; reload(); } });
+  const clear = h('button', { class: 'btn', onclick: () => { state.activityFilter = { staff_id: '', action: '', q: '', since: '', until: '' }; render(); loadActivity(false); } }, 'Clear');
+  queueMicrotask(paintActivity);
+  return h('div', {},
+    h('div', { class: 'page-title' }, h('h2', {}, 'Activity'), h('span', { class: 'muted' }, 'Everything staff have done, newest first.')),
+    state.error ? h('div', { class: 'error' }, state.error) : null,
+    h('div', { class: 'filters' }, staffSel, actSel, h('label', { class: 'date-field' }, 'From', since), h('label', { class: 'date-field' }, 'To', until), search, clear),
+    h('div', { id: 'activity-list' }));
 }
